@@ -9,12 +9,38 @@
 #include <map>
 #include <string>
 
-#include "spiInterface.hpp"
+#include "flashInterface.hpp"
 #include "spiFlashdb.hpp"
+
+/* Flash memory section record
+ * one instance per section when the bitstream contains gap
+ */
+class FlashDataSection {
+	public:
+		explicit FlashDataSection(uint32_t start_addr):_start_addr(start_addr) {}
+
+		/* append data set to existing */
+		void append(const uint8_t *data, size_t length) {
+			if (data && length > 0)
+				_record.insert(_record.end(), data, data + length);
+		}
+		/* Return section start addr */
+		uint32_t getStartAddr() const noexcept { return _start_addr; }
+		/* Return last data addr */
+		uint32_t getCurrentAddr() const noexcept { return _start_addr + static_cast<uint32_t>(_record.size()); }
+		/* Return section length */
+		size_t getLength() const noexcept { return _record.size(); }
+		/* Return section data set */
+		const std::vector<uint8_t> &getRecord() const noexcept { return _record; }
+
+	private:
+		uint32_t _start_addr; // Section Start Address
+		std::vector<uint8_t> _record; // Data set
+};
 
 class SPIFlash {
 	public:
-		SPIFlash(SPIInterface *spi, bool unprotect, int8_t verbose);
+		SPIFlash(FlashInterface *spi, bool unprotect, int8_t verbose);
 		/* power */
 		virtual void power_up();
 		virtual void power_down();
@@ -29,7 +55,7 @@ class SPIFlash {
 		int disable_protection();
 		/*!
 		 * \brief enable protection for selected blocks
-		 * \param[in] protect_code: bp + tb combinaison
+		 * \param[in] protect_code: bp + tb combination
 		 * \return -1 if write enable or enabling failed
 		 */
 		int enable_protection(uint8_t protect_code = 0x1c);
@@ -45,8 +71,14 @@ class SPIFlash {
 		 * \return false if unlock fail
 		 */
 		bool global_unlock();
-		/* erase */
-		int bulk_erase();
+		/*!
+		 * \brief bulk_erase: full Flash erase
+		 * \param[in] verbose: display message for each steps
+		 * \param[in] skip_bp_check: check if the flash is protected
+		 *            before erase, re-apply protect after.
+		 * \return 0 for success, -1 otherwise
+		 */
+		int bulk_erase(bool verbose=false, bool skip_bp_check=false);
 		/*!
 		 * \brief erase one sector (4Kb)
 		 */
@@ -64,7 +96,7 @@ class SPIFlash {
 		 */
 		int sectors_erase(int base_addr, int len);
 		/* write */
-		int write_page(int addr, uint8_t *data, int len);
+		int write_page(int addr, const uint8_t *data, int len);
 		/* read */
 		int read(int base_addr, uint8_t *data, int len);
 		/*!
@@ -79,12 +111,13 @@ class SPIFlash {
 		bool dump(const std::string &filename, const int &base_addr,
 				const int &len, int rd_burst = 0);
 		/* combo flash + erase */
-		int erase_and_prog(int base_addr, uint8_t *data, int len);
+		bool erase_and_prog(const std::vector<FlashDataSection> &sections, bool full_erase=false);
+		int erase_and_prog(int base_addr, const uint8_t *data, int len);
 		/*!
 		 * \brief check if area base_addr to base_addr + len match
 		 *        data content
 		 * \param[in] base_addr: base address to read
-		 * \param[in] data: theorical area content
+		 * \param[in] data: theoretical area content
 		 * \param[in] len: length (in Byte) to area and data
 		 * \param[in] rd_burst: size of packet to read
 		 * \return false if read fails or content didn't match, true otherwise
@@ -99,6 +132,7 @@ class SPIFlash {
 		virtual void read_id();
 		uint16_t readNonVolatileCfgReg();
 		uint16_t readVolatileCfgReg();
+		bool set_quad_bit(bool set_quad);
 
 	protected:
 		/*!
@@ -107,6 +141,21 @@ class SPIFlash {
 		 * \return -1 if unknown register, 1 or 0 otherwise
 		 */
 		int8_t get_tb();
+
+		/*!
+		 * \brief retrieve BP (Block protect) bit from status register
+		 * \return BP
+		 */
+		uint8_t get_bp();
+
+		/* \brief convert bp_offset (see spiFlashdb) to a mask
+		 * \return bitmask (0x1c (default) for unknown device)
+		 *         or based on bp_offset (see spiFlashdb)
+		 */
+		uint8_t get_bp_mask();
+
+	private:
+		bool prepare_flash(const int base_addr, const int len);
 
 	public:
 		/*!
@@ -124,11 +173,13 @@ class SPIFlash {
 		 */
 		uint8_t len_to_bp(uint32_t len);
 
-		SPIInterface *_spi;
+		FlashInterface *_spi;
 		int8_t _verbose;
 		uint32_t _jedec_id; /**< CHIP ID */
 		flash_t *_flash_model; /**< detect flash model */
 		bool _unprotect; /**< allows to unprotect memory before write */
+		bool _must_relock;
+		uint8_t _status;
 };
 
 #endif  // SRC_SPIFLASH_HPP_

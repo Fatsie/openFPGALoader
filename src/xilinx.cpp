@@ -1,37 +1,338 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
  * Copyright (C) 2019 Gwenhael Goavec-Merou <gwenhael.goavec-merou@trabucayre.com>
+ * Copyright (C) 2026 Apple Inc.
  */
 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 #include <unistd.h>
 
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <list>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "jtag.hpp"
 #include "bitparser.hpp"
+#include "common.hpp"
 #include "configBitstreamParser.hpp"
-#include "jedParser.hpp"
-#include "mcsParser.hpp"
-#include "spiFlash.hpp"
-#include "rawParser.hpp"
-
 #include "display.hpp"
-#include "xilinx.hpp"
-#include "xilinxMapParser.hpp"
+#include "jedParser.hpp"
+#include "jtag.hpp"
+#include "mcsParser.hpp"
 #include "part.hpp"
 #include "progressBar.hpp"
+#if defined (_WIN64) || defined (_WIN32)
+#include "pathHelper.hpp"
+#endif
+#include "rawParser.hpp"
+#include "spiFlash.hpp"
+#include "flashInterface.hpp"
+#include "xilinx.hpp"
+#include "xilinxMapParser.hpp"
+
+/* Used for xc3s */
+#define USER1       0x02
+#define USER4       0x23
+#define CFG_IN      0x05
+#define USERCODE    0x08
+#define IDCODE      0x09
+#define ISC_ENABLE  0x10
+#define JPROGRAM    0x0B
+#define JSTART      0x0C
+#define JSHUTDOWN   0x0D
+#define ISC_PROGRAM 0x11
+#define ISC_DISABLE 0x16
+#define BYPASS      0xff
+
+/* xc95 instructions set */
+#define XC95_IDCODE          0xfe
+#define XC95_ISC_ERASE       0xed
+#define XC95_ISC_ENABLE      0xe9
+#define XC95_ISC_DISABLE     0xf0
+#define XC95_XSC_BLANK_CHECK 0xe5
+#define XC95_ISC_PROGRAM     0xea
+#define XC95_ISC_READ        0xee
+
+/* DRP instructions set */
+#define XADC_DRP 0x37
+
+/* XADC Addresses */
+#define XADC_TEMP     0x00
+#define XADC_LOCK     0x00
+#define XADC_VCCINT   0x01
+#define XADC_VCCAUX   0x02
+#define XADC_VAUXEN   0x02
+#define XADC_VPVN     0x03
+#define XADC_RESET    0x03
+#define XADC_VREFP    0x04
+#define XADC_VREFN    0x05
+#define XADC_VCCBRAM  0x06
+#define XADC_SUPAOFFS 0x08
+#define XADC_ADCAOFFS 0x09
+#define XADC_ADCAGAIN 0x0a
+#define XADC_VCCPINT  0x0d
+#define XADC_VCCPAUX  0x0e
+#define XADC_VCCODDR  0x0f
+#define XADC_VAUX0    0x10
+#define XADC_VAUX1    0x11
+#define XADC_VAUX2    0x12
+#define XADC_VAUX3    0x13
+#define XADC_VAUX4    0x14
+#define XADC_VAUX5    0x15
+#define XADC_VAUX6    0x16
+#define XADC_VAUX7    0x17
+#define XADC_VAUX8    0x18
+#define XADC_VAUX9    0x19
+#define XADC_VAUX10   0x1a
+#define XADC_VAUX11   0x1b
+#define XADC_VAUX12   0x1c
+#define XADC_VAUX13   0x1d
+#define XADC_VAUX14   0x1e
+#define XADC_VAUX15   0x1f
+#define XADC_TEMP_MAX 0x20
+#define XADC_TEMP_MIN 0x24
+#define XADC_SUPBOFFS 0x30
+#define XADC_ADCBOFFS 0x31
+#define XADC_ADCBGAIN 0x32
+#define XADC_FLAG     0x3f
+#define XADC_CFG0     0x40
+#define XADC_CFG1     0x41
+#define XADC_CFG2     0x42
+#define XADC_SEQ0     0x48
+#define XADC_SEQ1     0x49
+#define XADC_SEQ2     0x4a
+#define XADC_SEQ3     0x4b
+#define XADC_SEQ4     0x4c
+#define XADC_SEQ5     0x4d
+#define XADC_SEQ6     0x4e
+#define XADC_SEQ7     0x4f
+#define XADC_ALARM0   0x50
+#define XADC_ALARM1   0x51
+#define XADC_ALARM2   0x52
+#define XADC_ALARM3   0x53
+#define XADC_ALARM4   0x54
+#define XADC_ALARM5   0x55
+#define XADC_ALARM6   0x56
+#define XADC_ALARM7   0x57
+#define XADC_ALARM8   0x58
+#define XADC_ALARM9   0x59
+#define XADC_ALARM10  0x5a
+#define XADC_ALARM11  0x5b
+#define XADC_ALARM12  0x5c
+#define XADC_ALARM13  0x5d
+#define XADC_ALARM14  0x5e
+#define XADC_ALARM15  0x5f
+
+#define XADC_VCC_MINOFFSET 0x24
+#define XADC_VCC_MAXOFFSET 0x20
+
+/* Boundary-scan instruction set based on the FPGA model */
+static std::map<std::string, std::map<std::string, std::vector<uint8_t>>>
+	ircode_mapping {
+		{
+			/* 7-series default */
+			"default",
+			{
+				{ "USER1",       {0x02} },
+				{ "USER2",       {0x03} },
+				{ "CFG_OUT",     {0x04} },
+				{ "CFG_IN",      {0x05} },
+				{ "USERCODE",    {0x08} },
+				{ "IDCODE",      {0x09} },
+				{ "ISC_ENABLE",  {0x10} },
+				{ "JPROGRAM",    {0x0B} },
+				{ "JSTART",      {0x0C} },
+				{ "JSHUTDOWN",   {0x0D} },
+				{ "ISC_PROGRAM", {0x11} },
+				{ "ISC_DISABLE", {0x16} },
+				{ "STATUS", 	 {0x1F} },
+				{ "BYPASS",      {0xff} },
+			}
+		},
+		{
+			/* Xilinx Virtex UltraScale+ */
+			/* <vivado_dir>/data/parts/xilinx/virtexuplus/public/bsdl/xcvu9p_flga2104.bsd */
+                        /* SLR1 is the master SLR  */
+			"virtexusp",
+			{
+				{ "USER1",       {0b00100100, 0b00101001, 0b00} },
+				{ "USER2",       {0b00100100, 0b00111001, 0b00} },
+				{ "USER4",       {0b00100100, 0b00111001, 0b10} },
+				{ "CFG_IN",      {0b00100100, 0b01011001, 0b00} },  // CFG_IN_SLR1
+				{ "CFG_OUT",     {0b00100100, 0b01001001, 0b00} },  // CFG_OUT_SLR1
+				{ "USERCODE",    {0b00100100, 0b10001001, 0b00} },
+				{ "IDCODE",      {0b01001001, 0b10010010, 0b00} },
+				{ "ISC_ENABLE",  {0b00010000, 0b00000100, 0b01} },
+				{ "JPROGRAM",    {0b11001011, 0b10110010, 0b00} },
+				{ "JSTART",      {0b00001100, 0b11000011, 0b00} },
+				{ "JSHUTDOWN",   {0b01001101, 0b11010011, 0b00} },
+				{ "ISC_PROGRAM", {0b01010001, 0b00010100, 0b01} },
+				{ "ISC_DISABLE", {0b10010110, 0b01100101, 0b01} },
+				{ "BYPASS",      {0b11111111, 0b11111111, 0b11} },
+			}
+		},
+		{
+			/* Xilinx Virtex UltraScale+ */
+			/* <vivado_dir>/data/parts/xilinx/virtexuplus/public/bsdl/xcvu7p_flvb2104.bsd */
+			"virtexusp_vu7p",
+			{
+				{ "USER1",       {0b10100100, 0b0000} },
+				{ "USER2",       {0b11100100, 0b0000} },
+				{ "USER4",       {0b11100100, 0b1000} },
+				{ "CFG_IN",      {0b01100100, 0b0001} }, // CFG_IN_SLR0
+				{ "CFG_OUT",     {0b00100100, 0b0001} }, // CFG_OUT_SLR0
+				{ "USERCODE",    {0b00100100, 0b0010} },
+				{ "IDCODE",      {0b01001001, 0b0010} },
+				{ "ISC_ENABLE",  {0b00010000, 0b0100} },
+				{ "JPROGRAM",    {0b11001011, 0b0010} },
+				{ "JSTART",      {0b00001100, 0b0011} },
+				{ "JSHUTDOWN",   {0b01001101, 0b0011} },
+				{ "ISC_PROGRAM", {0b01010001, 0b0100} },
+				{ "ISC_DISABLE", {0b10010110, 0b0101} },
+				{ "BYPASS",      {0b11111111, 0b1111} }
+			}
+		},
+		{
+			/* Xilinx Virtex UltraScale+ VU19P (xcvu19p_fsva3824) */
+			/* 4-SLR SSI; SLR1 is master per BSDL */
+			"virtexusp_vu19p",
+			{
+				{ "USER1",       {0b00100100, 0b01001001, 0b00001010} },
+				{ "USER2",       {0b00100100, 0b01001001, 0b00001110} },
+				{ "CFG_IN",      {0b00100100, 0b01001001, 0b00010110} },
+				{ "CFG_OUT",     {0b00100100, 0b01001001, 0b00010010} },
+				{ "USERCODE",    {0b00100100, 0b01001001, 0b00100010} },
+				{ "IDCODE",      {0b01001001, 0b10010010, 0b00100100} },
+				{ "ISC_ENABLE",  {0b00010000, 0b00000100, 0b01000001} },
+				{ "JPROGRAM",    {0b11001011, 0b10110010, 0b00101100} },
+				{ "JSTART",      {0b00001100, 0b11000011, 0b00110000} },
+				{ "JSHUTDOWN",   {0b01001101, 0b11010011, 0b00110100} },
+				{ "ISC_PROGRAM", {0b01010001, 0b00010100, 0b01000101} },
+				{ "ISC_DISABLE", {0b10010110, 0b01100101, 0b01011001} },
+				{ "BYPASS",      {0b11111111, 0b11111111, 0b11111111} },
+			}
+		}
+};
+
+/* Helper to get instruction code as a uint8_t pointer * */
+static uint8_t *get_ircode(
+	std::map<std::string, std::vector<uint8_t>> &inst_map, std::string inst)
+{
+	return inst_map.at(inst).data();
+}
+
+static void open_bitfile(
+	const std::string &filename, const std::string &extension,
+	ConfigBitstreamParser **parser, bool reverse, bool verbose)
+{
+	printInfo("Open file " + filename + " ", false);
+	try {
+		if (extension == "bit") {
+			*parser = new BitParser(filename, reverse, verbose);
+		} else if (extension == "mcs") {
+			*parser = new McsParser(filename, reverse, verbose);
+		} else {
+			*parser = new RawParser(filename, reverse);
+		}
+	} catch (const std::exception &e) {
+		throw std::runtime_error("Unable to open '" + filename + "': " + e.what());
+	}
+
+	printSuccess("DONE");
+
+	printInfo("Parse file ", false);
+	if ((*parser)->parse() == EXIT_FAILURE) {
+		throw std::runtime_error("Failed to parse bitstream '" + filename + "'");
+	}
+
+	printSuccess("DONE");
+}
+
+#define FUSE_DNA	0x32
+
+uint64_t Xilinx::fuse_dna_read(void)
+{
+	unsigned char tx_data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+	unsigned char rx_data[8];
+
+	_jtag->go_test_logic_reset();
+	_jtag->shiftIR(FUSE_DNA, 6);
+	_jtag->shiftDR((unsigned char *)&tx_data, (unsigned char *)&rx_data, 64);
+
+	uint64_t dna = 0;
+
+	for(int i = 0; i < 8; i++) {
+		unsigned char rev = 0;
+		for (int j = 0; j < 8; j++) {
+			rev |= ((rx_data[i] >> j) & 1) << (7 - j);
+		}
+		dna = (dna << 8ULL) | rev;
+	}
+
+	return dna & 0x1ffffffffffffff;
+}
+
+unsigned int Xilinx::xadc_read(uint16_t addr)
+{
+	unsigned int tx_data = (1 << 26) | (addr << 16);
+	unsigned int rx_data = 0;
+
+	_jtag->go_test_logic_reset();
+	_jtag->shiftIR(XADC_DRP, 6);
+	_jtag->shiftDR((unsigned char *)&tx_data, (unsigned char *)&rx_data, 32);
+	usleep(1000);
+	_jtag->shiftIR(XADC_DRP, 6);
+	_jtag->shiftDR((unsigned char *)&tx_data, (unsigned char *)&rx_data, 32);
+
+	return rx_data;
+}
+
+void Xilinx::xadc_write(uint16_t addr, uint16_t data)
+{
+	unsigned int tx_data = (1 << 26) | (addr << 16) | data;
+	unsigned int rx_data = 0;
+
+	_jtag->go_test_logic_reset();
+	_jtag->shiftIR(XADC_DRP, 6);
+	_jtag->shiftDR((unsigned char *)&tx_data, (unsigned char *)&rx_data, 32);
+}
+
+unsigned int Xilinx::xadc_single(uint16_t ch)
+{
+	_jtag->go_test_logic_reset();
+	// single channel, disable the sequencer
+	xadc_write(XADC_CFG1, 0x3000);
+	// set channel, no averaging, additional settling time
+	xadc_write(XADC_CFG0, (1 << 15) | (1 << 8) | ch);
+	// leave some time (1ms) for the conversion
+	usleep(1000);
+	unsigned int ret = xadc_read(ch);
+
+	return ret;
+}
 
 Xilinx::Xilinx(Jtag *jtag, const std::string &filename,
+	const std::string &secondary_filename,
 	const std::string &file_type,
 	Device::prog_type_t prg_type,
-	const std::string &device_package, bool verify, int8_t verbose):
+	const std::string &device_package,
+	const bool spi_flash_type,
+	const std::string &spiOverJtagPath,
+	const std::string &target_flash,
+	bool verify, int8_t verbose,
+	bool skip_load_bridge, bool skip_reset, bool read_dna, bool read_xadc):
 	Device(jtag, filename, file_type, verify, verbose),
-	SPIInterface(filename, verbose, 256, verify),
-	_device_package(device_package)
+	FlashInterface(filename, verbose, 256, verify, skip_load_bridge,
+				 skip_reset),
+	_device_package(device_package), _spiOverJtagPath(spiOverJtagPath),
+	_irlen(6), _secondary_filename(secondary_filename), _soj_is_v2(false),
+	_jtag_chain_len(1), _is_bpi_board(!spi_flash_type)
 {
 	if (prg_type == Device::RD_FLASH) {
 		_mode = Device::READ_MODE;
@@ -45,30 +346,95 @@ Xilinx::Xilinx(Jtag *jtag, const std::string &filename,
 				_mode = Device::SPI_MODE;
 		} else if (_file_extension == "jed") {
 			_mode = Device::FLASH_MODE;
-		} else {
+		} else if (_file_extension == "pdi") {
+			_mode = Device::MEM_MODE;
+		}  else {
 			_mode = Device::SPI_MODE;
+		}
+	}
+
+	select_flash_chip(PRIMARY_FLASH);
+
+	if (target_flash == "primary") {
+		_flash_chips = PRIMARY_FLASH;
+	} else if (target_flash == "secondary") {
+		_flash_chips = SECONDARY_FLASH;
+	} else if (target_flash == "both") {
+		_flash_chips = (PRIMARY_FLASH | SECONDARY_FLASH);
+	} else {
+		throw std::runtime_error("Error: unknown flash target: " + target_flash);
+	}
+
+	if (_flash_chips & SECONDARY_FLASH) {
+		_secondary_file_extension = secondary_filename.substr(
+			secondary_filename.find_last_of(".") + 1);
+		_mode = Device::SPI_MODE;
+		if (!(_device_package == "xcvu9p-flga2104" || _device_package == "xcvu9p-flgb2104" || _device_package == "xcku5p-ffvb676" || _device_package == "xcku040-ffva1156")) {
+			throw std::runtime_error("Error: secondary flash unavailable");
 		}
 	}
 
 	uint32_t idcode = _jtag->get_target_device_id();
 	std::string family = fpga_list[idcode].family;
+	std::string model = fpga_list[idcode].model;
+	_irlen = fpga_list[idcode].irlength;
+	_ircode_map = ircode_mapping.at("default");
+
 	if (family.substr(0, 5) == "artix") {
 		_fpga_family = ARTIX_FAMILY;
 	} else if (family == "spartan7") {
 		_fpga_family = SPARTAN7_FAMILY;
 	} else if (family == "zynq") {
 		_fpga_family = ZYNQ_FAMILY;
+		/* DNA read uses a 7-series PL JTAG instruction and should not
+		 * be blocked by the Zynq PS-side SPI flash restriction.
+		 */
+		if (_mode != Device::MEM_MODE && !read_dna) {
+			char mess[256];
+			snprintf(mess, 256, "Error: can't flash non-volatile memory for "
+				"Zynq7000 devices\n"
+				"\tSPI Flash access is only available from PS side\n");
+			throw std::runtime_error(mess);
+		}
 	} else if (family.substr(0, 6) == "zynqmp") {
+		if (_mode != Device::MEM_MODE) {
+			char mess[256];
+			snprintf(mess, 256, "Error: can't flash non-volatile memory for "
+				"ZynqMP devices\n"
+				"\tSPI Flash access is only available from PSU side\n");
+			throw std::runtime_error(mess);
+		}
 		if (!zynqmp_init(family))
 			throw std::runtime_error("Error with ZynqMP init");
 		_fpga_family = ZYNQMP_FAMILY;
 	} else if (family == "kintex7") {
 		_fpga_family = KINTEX_FAMILY;
-	} else if (family == "spartan3") {
-		_fpga_family = SPARTAN3_FAMILY;
-		if (_mode != Device::MEM_MODE) {
-			throw std::runtime_error("Error: Only load to mem is supported");
+	} else if (family == "kintexus") {
+		_fpga_family = KINTEXUS_FAMILY;
+	} else if (family == "kintexusp") {
+		_fpga_family = KINTEXUSP_FAMILY;
+	} else if (family == "artixusp") {
+		_fpga_family = ARTIXUSP_FAMILY;
+	} else if (family == "spartanusp") {
+		if (_file_extension != "pdi") {
+			char mess[256];
+			snprintf(mess, 256, "Error: only volatile PDI programing for "
+				"Spartan Ultrascale+ devices\n");
+			throw std::runtime_error(mess);
 		}
+		_fpga_family = SPARTANUSP_FAMILY;
+	} else if (family == "virtexus") {
+		_fpga_family = VIRTEXUS_FAMILY;
+	} else if (family == "virtexusp") {
+		_fpga_family = VIRTEXUSP_FAMILY;
+		if (model == "xcvu19p")
+			_ircode_map = ircode_mapping.at("virtexusp_vu19p");
+		else if (model == "xcvu7p")
+			_ircode_map = ircode_mapping.at("virtexusp_vu7p");
+		else
+			_ircode_map = ircode_mapping.at("virtexusp");
+	} else if (family.substr(0, 8) == "spartan3") {
+		_fpga_family = SPARTAN3_FAMILY;
 	} else if (family == "xcf") {
 		_fpga_family = XCF_FAMILY;
 		if (_mode == Device::MEM_MODE) {
@@ -96,6 +462,76 @@ Xilinx::Xilinx(Jtag *jtag, const std::string &filename,
 		}
 	} else {
 		_fpga_family = UNKNOWN_FAMILY;
+	}
+
+	if (read_dna) {
+		if (_fpga_family == ARTIX_FAMILY || _fpga_family == KINTEXUS_FAMILY ||
+			_fpga_family == ZYNQ_FAMILY) {
+			uint64_t dna = Xilinx::fuse_dna_read();
+			printf("{\"dna\": \"0x%016" PRIx64 "\"}\n", dna);
+		} else {
+			throw std::runtime_error("Error: read_dna only supported for 7-series style Xilinx FPGA");
+		}
+	}
+
+	if (read_xadc) {
+		if (_fpga_family == ARTIX_FAMILY || _fpga_family == KINTEXUS_FAMILY) {
+			// calibrate XADC
+			Xilinx::xadc_single(8);
+
+			const int MAX_CHANNEL = 8;
+			const int TEMP_MEAS   = 4;
+
+			unsigned int v = 0;
+			for (int i = 0; i < TEMP_MEAS; i++) {
+				v += Xilinx::xadc_single(XADC_TEMP);
+			}
+			double temp = ((v/(double)TEMP_MEAS) * 503.975)/(1 << 16) - 273.15;
+			double max_temp = (Xilinx::xadc_single(XADC_TEMP_MAX) * 503.975)/(1 << 16) - 273.15;
+			double min_temp = (Xilinx::xadc_single(XADC_TEMP_MIN) * 503.975)/(1 << 16) - 273.15;
+
+			unsigned int channel_values[32];
+			for (int ch = 0; ch < MAX_CHANNEL; ch++) {
+				if (ch < 7 || ch > 12) {
+					v = Xilinx::xadc_single(ch);
+				} else {
+					// 7 = Invalid channel selection
+					// 8 = Carry out XADC calibration
+					// 9...12 = Invalid channel selection
+					v = 0;
+				}
+				channel_values[ch] = v;
+			}
+
+			double vccint = (Xilinx::xadc_single(XADC_VCCINT)>>4)/4096.0 * 3.0; // ref: UG480
+			double vccintmax = (Xilinx::xadc_single(XADC_VCCINT + XADC_VCC_MAXOFFSET)>>4)/4096.0 * 3.0; // ref: UG480
+			double vccintmin = (Xilinx::xadc_single(XADC_VCCINT + XADC_VCC_MINOFFSET)>>4)/4096.0 * 3.0; // ref: UG480
+
+			double vccaux = (Xilinx::xadc_single(XADC_VCCAUX)>>4)/4096.0 * 3.0; // ref: UG480
+			double vccauxmax = (Xilinx::xadc_single(XADC_VCCAUX + XADC_VCC_MAXOFFSET)>>4)/4096.0 * 3.0; // ref: UG480
+			double vccauxmin = (Xilinx::xadc_single(XADC_VCCAUX + XADC_VCC_MINOFFSET)>>4)/4096.0 * 3.0; // ref: UG480
+
+			/* output as JSON dict */
+			std::cout << "{";
+			std::cout << "\"temp\": " << temp << ", " << std::endl;;
+			std::cout << "    \"maxtemp\": " << max_temp << ", " << std::endl;;
+			std::cout << "    \"mintemp\": " << min_temp << ", " << std::endl;;
+			std::cout << "\"raw\":  {";
+			for (int ch = 0; ch < MAX_CHANNEL; ch++) {
+				std::cout << "\"" << ch << "\": " << channel_values[ch]
+					 << ((ch == MAX_CHANNEL - 1)? "}" : ", ");
+			}
+			std::cout << "," << std::endl;
+			std::cout << "\"vccint\": " << vccint << ", " << std::endl;
+			std::cout << "   \"maxvccint\": " << vccintmax << ", " << std::endl;
+			std::cout << "   \"minvccint\": " << vccintmin << ", " << std::endl;
+			std::cout << "\"vccaux\": " << vccaux << ", " << std::endl;
+			std::cout << "   \"maxvccaux\": " << vccauxmax << ", " << std::endl;
+			std::cout << "   \"minvccaux\": " << vccauxmin << ", " << std::endl;
+			std::cout << "}" << std::endl;
+		} else {
+			throw std::runtime_error("Error: read_xadc only supported for Artix 7");
+		}
 	}
 }
 Xilinx::~Xilinx() {}
@@ -130,7 +566,7 @@ bool Xilinx::zynqmp_init(const std::string &family)
 	 * ARM at position 1
 	 */
 	char mess[256];
-	std::vector<int> listDev = _jtag->get_devices_list();
+	std::vector<uint32_t> listDev = _jtag->get_devices_list();
 	if (listDev.size() != 2) {
 		snprintf(mess, sizeof(mess), "ZynqMP error: wrong"
 				" JTAG length: %zu instead of 2\n",
@@ -157,53 +593,34 @@ bool Xilinx::zynqmp_init(const std::string &family)
 
 	_jtag->insert_first(0xdeadbeef, 6);
 	_jtag->device_select(1);
+	_irlen = 6;
 
 	return true;
 }
 
-#define USER1	0x02
-#define CFG_IN   0x05
-#define USERCODE   0x08
-#define IDCODE     0x09
-#define ISC_ENABLE 0x10
-#define JPROGRAM 0x0B
-#define JSTART   0x0C
-#define JSHUTDOWN 0x0D
-#define ISC_PROGRAM 0x11
-#define ISC_DISABLE 0x16
-#define BYPASS   0xff
-
-/* xc95 instructions set */
-#define XC95_IDCODE          0xfe
-#define XC95_ISC_ERASE       0xed
-#define XC95_ISC_ENABLE      0xe9
-#define XC95_ISC_DISABLE     0xf0
-#define XC95_XSC_BLANK_CHECK 0xe5
-#define XC95_ISC_PROGRAM     0xea
-#define XC95_ISC_READ        0xee
-
 void Xilinx::reset()
 {
-	_jtag->shiftIR(JSHUTDOWN, 6);
-	_jtag->shiftIR(JPROGRAM, 6);
+	_jtag->shiftIR(get_ircode(_ircode_map, "JSHUTDOWN"), NULL, _irlen);
+	_jtag->shiftIR(get_ircode(_ircode_map, "JPROGRAM"), NULL, _irlen);
 	_jtag->set_state(Jtag::RUN_TEST_IDLE);
 	_jtag->toggleClk(10000*12);
 
 	_jtag->set_state(Jtag::RUN_TEST_IDLE);
 	_jtag->toggleClk(2000);
 
-	_jtag->shiftIR(BYPASS, 6);
+	_jtag->shiftIR(get_ircode(_ircode_map, "BYPASS"), NULL, _irlen);
 	_jtag->set_state(Jtag::RUN_TEST_IDLE);
 	_jtag->toggleClk(2000);
 }
 
-int Xilinx::idCode()
+uint32_t Xilinx::idCode()
 {
 	int id = 0;
 	unsigned char tx_data[4]= {0x00, 0x00, 0x00, 0x00};
 	unsigned char rx_data[4];
 	_jtag->go_test_logic_reset();
-	_jtag->shiftIR(IDCODE, 6);
+
+	_jtag->shiftIR(get_ircode(_ircode_map, "IDCODE"), NULL, _irlen);
 	_jtag->shiftDR(tx_data, rx_data, 32);
 	id = ((rx_data[0] & 0x000000ff) |
 		((rx_data[1] << 8) & 0x0000ff00) |
@@ -228,7 +645,8 @@ int Xilinx::idCode()
 
 void Xilinx::program(unsigned int offset, bool unprotect_flash)
 {
-	ConfigBitstreamParser *bit;
+	ConfigBitstreamParser *bit = nullptr;
+	ConfigBitstreamParser *secondary_bit = nullptr;
 	bool reverse = false;
 
 	/* nothing to do */
@@ -236,10 +654,11 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
 		return;
 
 	if (_mode == Device::FLASH_MODE && _file_extension == "jed") {
-		JedParser *jed;
+		if (_fpga_family != XC95_FAMILY && _fpga_family != XC2C_FAMILY)
+			throw std::runtime_error("Error: jed only supported for xc95 and xc2c");
 		printInfo("Open file ", false);
 
-		jed = new JedParser(_filename, _verbose);
+		std::unique_ptr<JedParser> jed(new JedParser(_filename, _verbose));
 		if (jed->parse() == EXIT_FAILURE) {
 			printError("FAIL");
 			return;
@@ -247,11 +666,9 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
 		printSuccess("DONE");
 
 		if (_fpga_family == XC95_FAMILY)
-			flow_program(jed);
+			flow_program(jed.get());
 		else if (_fpga_family == XC2C_FAMILY)
-			xc2c_flow_program(jed);
-		else
-			throw std::runtime_error("Error: jed only supported for xc95 and xc2c");
+			xc2c_flow_program(jed.get());
 		return;
 	}
 
@@ -263,32 +680,31 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
 	if (_mode == Device::MEM_MODE || _fpga_family == XCF_FAMILY)
 		reverse = true;
 
-	printInfo("Open file ", false);
+	if (_file_extension == "pdi")
+		reverse = false;
+
 	try {
-		if (_file_extension == "bit")
-			bit = new BitParser(_filename, reverse, _verbose);
-		else if (_file_extension == "mcs")
-			bit = new McsParser(_filename, reverse, _verbose);
-		else
-			bit = new RawParser(_filename, reverse);
+		if (_flash_chips & PRIMARY_FLASH) {
+			open_bitfile(_filename, _file_extension, &bit, reverse, _verbose);
+		}
+		if (_flash_chips & SECONDARY_FLASH) {
+			open_bitfile(_secondary_filename, _secondary_file_extension,
+				&secondary_bit, reverse, _verbose);
+		}
 	} catch (std::exception &e) {
-		printError("FAIL");
-		return;
+		if (bit)
+			delete bit;
+		if (secondary_bit)
+			delete secondary_bit;
+		throw std::runtime_error(e.what());
 	}
 
-	printSuccess("DONE");
-
-	printInfo("Parse file ", false);
-	if (bit->parse() == EXIT_FAILURE) {
-		printError("FAIL");
-		delete bit;
-		return;
-	} else {
-		printSuccess("DONE");
+	if (_verbose) {
+		if (bit)
+			bit->displayHeader();
+		if (secondary_bit)
+			secondary_bit->displayHeader();
 	}
-
-	if (_verbose)
-		bit->displayHeader();
 
 	if (_fpga_family == XCF_FAMILY) {
 		xcf_program(bit);
@@ -296,51 +712,252 @@ void Xilinx::program(unsigned int offset, bool unprotect_flash)
 		return;
 	}
 
-	if (_mode == Device::SPI_MODE)
-		program_spi(bit, offset, unprotect_flash);
-	else
-		program_mem(bit);
+	if (_mode == Device::SPI_MODE) {
+		/* Check for BPI flash boards */
+		if (_is_bpi_board) {
+			program_bpi(bit, offset);
+		} else {
+			if (_flash_chips & PRIMARY_FLASH) {
+				select_flash_chip(PRIMARY_FLASH);
+				program_spi(bit, _file_extension, offset, unprotect_flash);
+			}
+			if (_flash_chips & SECONDARY_FLASH) {
+				select_flash_chip(SECONDARY_FLASH);
+				program_spi(secondary_bit, _secondary_file_extension, offset, unprotect_flash);
+			}
+		}
+	} else {
+		if (_fpga_family == SPARTAN3_FAMILY)
+			xc3s_flow_program(bit);
+		else
+			program_mem(bit);
+	}
 
 	delete bit;
 }
 
-bool Xilinx::load_bridge()
+bool Xilinx::post_flash_access()
 {
-	if (_device_package.empty()) {
-		printError("Can't program SPI flash: missing device-package information");
-		return false;
+	if (_skip_reset)
+		printInfo("Skip resetting device");
+	else
+		reset();
+	return true;
+}
+
+bool Xilinx::prepare_flash_access()
+{
+	bool ret = false;
+	if (_skip_load_bridge) {
+		printInfo("Skip loading bridge for spiOverjtag");
+		ret = true;
+	} else {
+		ret = load_bridge();
 	}
 
-	// DATA_DIR is defined at compile time.
-	std::string bitname = DATA_DIR "/openFPGALoader/spiOverJtag_";
-	bitname += _device_package + ".bit.gz";
+	/* Get number of FPGAs in the Jtag Chain */
+	_jtag_chain_len = _jtag->get_chain_len();
 
-	std::cout << "use: " << bitname << std::endl;
+	/* check SpiOverJtag version */
+	if (ret) {
+		if (get_spiOverJtag_version() == 2.0f)
+			_soj_is_v2 = true;
+		printf("SOJ version: %f\n", _soj_is_v2 ? 2.0f : 1.0f);
+	}
+	return ret;
+}
+
+bool Xilinx::load_bridge()
+{
+	std::string bitname;
+	if (!_spiOverJtagPath.empty()) {
+		bitname = _spiOverJtagPath;
+	} else {
+		if (_device_package.empty()) {
+			printError("Can't program SPI flash: missing device-package information");
+			return false;
+		}
+
+		bitname = get_shell_env_var("OPENFPGALOADER_SOJ_DIR", DATA_DIR "/openFPGALoader");
+		bitname += "/spiOverJtag_" + _device_package + ".bit.gz";
+	}
+
+#if defined (_WIN64) || defined (_WIN32)
+	/* Convert relative path embedded at compile time to an absolute path */
+	bitname = PathHelper::absolutePath(bitname);
+#endif
 
 	/* first: load spi over jtag */
 	try {
 		BitParser bridge(bitname, true, _verbose);
+		printSuccess("Use: " + bridge.getFilename());
+
+		bridge.parse();
+		if (_fpga_family == SPARTAN3_FAMILY)
+			xc3s_flow_program(&bridge);
+		else
+			program_mem(&bridge);
+	} catch (std::exception &e) {
+		printError(e.what());
+		throw std::runtime_error(e.what());
+	}
+
+	return true;
+}
+
+bool Xilinx::load_bpi_bridge()
+{
+	std::string bitname;
+
+	if (_device_package.empty()) {
+		printError("Can't program BPI flash: missing device-package information");
+		return false;
+	}
+
+	bitname = get_shell_env_var("OPENFPGALOADER_SOJ_DIR", DATA_DIR "/openFPGALoader");
+	bitname += "/bpiOverJtag_" + _device_package + ".bit.gz";
+
+#if defined (_WIN64) || defined (_WIN32)
+	bitname = PathHelper::absolutePath(bitname);
+#endif
+
+	/* Load BPI over JTAG bridge */
+	try {
+		BitParser bridge(bitname, true, _verbose);
+		printSuccess("Use: " + bridge.getFilename());
+
 		bridge.parse();
 		program_mem(&bridge);
 	} catch (std::exception &e) {
 		printError(e.what());
 		throw std::runtime_error(e.what());
 	}
+
+	/* Initialize BPI flash instance */
+	_bpi_flash.reset(new BPIFlash(_jtag, _verbose));
+
 	return true;
 }
 
-void Xilinx::program_spi(ConfigBitstreamParser * bit, unsigned int offset,
-		bool unprotect_flash)
+void Xilinx::program_bpi(ConfigBitstreamParser *bit, unsigned int offset)
 {
-	uint8_t *data = bit->getData();
+	if (!bit)
+		throw std::runtime_error("called with null bitstream");
+
+	/* Load BPI bridge if not already loaded */
+	if (!_bpi_flash) {
+		if (!load_bpi_bridge()) {
+			throw std::runtime_error("Failed to load BPI bridge");
+		}
+	}
+
+	/* Detect flash */
+	if (!_bpi_flash->detect()) {
+		throw std::runtime_error("BPI flash detection failed");
+	}
+
+	/* Program the flash */
+	const uint8_t *data = bit->getData();
 	int length = bit->getLength() / 8;
-	SPIInterface::write(offset, data, length, unprotect_flash);
+
+	if (!_bpi_flash->write(offset, data, length)) {
+		throw std::runtime_error("BPI flash programming failed");
+	}
+
+	/* Reset the board if skip_reset is not set */
+	post_flash_access();
+
+	printInfo("BPI flash programming complete");
+}
+
+bool Xilinx::dumpFlash_bpi(uint32_t base_addr, uint32_t len)
+{
+	if (!_bpi_flash) {
+		if (!load_bpi_bridge())
+			return false;
+	}
+	if (!_bpi_flash->detect()) {
+		printError("BPI flash detection failed");
+		return false;
+	}
+	if (len == 0)
+		len = _bpi_flash->capacity();
+	std::vector<uint8_t> buf(len);
+	printInfo("Reading BPI flash (slow, one word per USB round-trip)...");
+	if (!_bpi_flash->read(buf.data(), base_addr, len)) {
+		printError("BPI Flash read failed");
+		return false;
+	}
+	FILE *fd = fopen(_filename.c_str(), "wb");
+	if (!fd) {
+		printError("Can't open dump file");
+		return false;
+	}
+	fwrite(buf.data(), 1, len, fd);
+	fclose(fd);
+	printSuccess("BPI dump DONE");
+	return post_flash_access();
+}
+
+float Xilinx::get_spiOverJtag_version()
+{
+	uint8_t jtx[6] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+	uint8_t jrx[7];
+	uint8_t rx[6];
+
+	uint32_t idcode = _jtag->get_target_device_id();
+
+	/* Select the correct device and its associated USER4 register */
+	if (fpga_list[idcode].family == "virtexusp" &&
+			fpga_list[idcode].model == "xcvu7p") {
+		_jtag->shiftIR(get_ircode(_ircode_map, "USER4"), NULL, _irlen);
+	}
+	else if (fpga_list[idcode].family == "virtexusp" &&
+			fpga_list[idcode].model == "xcvu9p") {
+        	_jtag->shiftIR(get_ircode(_ircode_map, "USER4"), NULL, _irlen);
+	}
+	else {
+		_jtag->shiftIR(USER4, _irlen, Jtag::UPDATE_IR);
+	}
+
+	printf("jtag_chain_len: %d\n", _jtag_chain_len);
+	if (_jtag_chain_len > 1)
+		_jtag->shiftDR(jtx, NULL, _jtag_chain_len - 1, Jtag::SHIFT_DR);
+	_jtag->shiftDR(jtx, jrx, 6 * 8);
+	_jtag->flush();
+
+	memcpy(rx, &jrx[1], 5);
+	rx[5] = '\0';
+
+	float version = atof((const char *)rx);
+	if (version == 0.0f)  // not supported => 1.0
+		return 1.0f;
+	return version;
+}
+
+void Xilinx::program_spi(ConfigBitstreamParser * bit, std::string extention,
+		unsigned int offset, bool unprotect_flash)
+{
+	if (!bit)
+		throw std::runtime_error("called with null bitstream");
+	if (extention == "mcs") {
+		McsParser *parser = (McsParser *)bit;
+		if (!FlashInterface::write(parser->getRecords(), unprotect_flash, true))
+			throw std::runtime_error("SPI flash write failed");
+	} else {
+		const uint8_t *data = bit->getData();
+		int length = bit->getLength() / 8;
+		if (!FlashInterface::write(offset, data, length, unprotect_flash))
+			throw std::runtime_error("SPI flash write failed");
+	}
 }
 
 void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 {
 	std::cout << "load program" << std::endl;
-	unsigned char tx_buf, rx_buf;
+	unsigned char *tx_buf;
+	unsigned char rx_buf[(_irlen >> 3) + 1];
+
 	/*            comment                                TDI   TMS TCK
 	 * 1: On power-up, place a logic 1 on the TMS,
 	 *    and clock the TCK five times. This ensures      X     1   5
@@ -360,12 +977,12 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 	 *    TCK five times. This ensures starting in        X     1   5
 	 *    the TLR (Test-Logic-Reset) state.
 	 */
-	_jtag->shiftIR(JPROGRAM, 6);
-	/* test */
-	tx_buf = BYPASS;
+	_jtag->shiftIR(get_ircode(_ircode_map, "JPROGRAM"), NULL, _irlen);
+	/* Poll INIT_B (bit 4 of IR capture) until config memory is cleared */
+	tx_buf = get_ircode(_ircode_map, "BYPASS");
 	do {
-		_jtag->shiftIR(&tx_buf, &rx_buf, 6);
-	} while (!(rx_buf &0x01));
+		_jtag->shiftIR(tx_buf, rx_buf, _irlen);
+	} while (!(rx_buf[0] & 0x10));
 	/*
 	 * 8: Move into the RTI state.                        X     0   10,000(1)
 	 */
@@ -378,7 +995,7 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 	 *     exiting SHIFT-IR, as defined in the            0     1   1
 	 *     IEEE standard.
 	 */
-	_jtag->shiftIR(CFG_IN, 6);
+	_jtag->shiftIR(get_ircode(_ircode_map, "CFG_IN"), NULL, _irlen);
 	/*
 	 * 11: Enter the SELECT-DR state.                     X     1   2
 	 */
@@ -392,11 +1009,12 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 	 */
 	/* GGM: TODO */
 	int byte_length = bitfile->getLength() / 8;
-	uint8_t *data = bitfile->getData();
-	int tx_len, tx_end;
-	int burst_len = byte_length / 100;
+	const uint8_t *data = bitfile->getData();
+	int tx_len;
+	Jtag::tapState_t tx_end;
+	const int burst_len = (byte_length < 100) ? byte_length : byte_length / 100;
 
-	ProgressBar progress("Flash SRAM", byte_length, 50, _quiet);
+	ProgressBar progress("Load SRAM", byte_length, 50, _quiet);
 
 	for (int i=0; i < byte_length; i+=burst_len) {
 		if (i + burst_len > byte_length) {
@@ -407,9 +1025,9 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 			tx_end = Jtag::UPDATE_DR;
 		} else {
 			tx_len = burst_len * 8;
-	        /*
-	         * 12: Enter the SHIFT-DR state.              X     0   2
-	         */
+			/*
+			 * 12: Enter the SHIFT-DR state.              X     0   2
+			 */
 			tx_end = Jtag::SHIFT_DR;
 		}
 		_jtag->shiftDR(data+i, NULL, tx_len, tx_end);
@@ -421,32 +1039,302 @@ void Xilinx::program_mem(ConfigBitstreamParser *bitfile)
 	 * 16: Move into RTI state.                           X     0   1
 	 */
 	_jtag->set_state(Jtag::RUN_TEST_IDLE);
-	/*
-	 * 17: Enter the SELECT-IR state.                     X     1   2
-	 * 18: Move to the SHIFT-IR state.                    X     0   2
-	 * 19: Start loading the JSTART instruction 
-	 *     (optional). The JSTART instruction           01100   0   5
-	 *     initializes the startup sequence.
-	 * 20: Load the last bit of the JSTART instruction.   0     1   1
-	 * 21: Move to the UPDATE-IR state.                   X     1   1
+
+	if (_file_extension == "pdi") {
+		_jtag->toggleClk(2000);
+		/*
+		* 17: For PDI devices, use the STATUS instruction
+		*     to verify successful configuration.
+		*/
+		unsigned char tx_data[6]= {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		unsigned char rx_data[6];
+		_jtag->shiftIR(get_ircode(_ircode_map, "STATUS"), NULL, _irlen);
+		_jtag->shiftDR(tx_data, rx_data, 48);
+		if ((rx_data[4] & 0x04) != 0x04) {
+				printError("PDI programing failed");
+			} else {
+				printSuccess("PDI programing success");
+			}
+		}
+	else {
+		/*
+		* 17: Enter the SELECT-IR state.                     X     1   2
+		* 18: Move to the SHIFT-IR state.                    X     0   2
+		* 19: Start loading the JSTART instruction
+		*     (optional). The JSTART instruction           01100   0   5
+		*     initializes the startup sequence.
+		* 20: Load the last bit of the JSTART instruction.   0     1   1
+		* 21: Move to the UPDATE-IR state.                   X     1   1
+		*/
+		_jtag->shiftIR(get_ircode(_ircode_map, "JSTART"), NULL, _irlen, Jtag::UPDATE_IR);
+		/*
+		* 22: Move to the RTI state and clock the
+		*     startup sequence by applying a minimum         X     0   2000
+		*     of 2000 clock cycles to the TCK.
+		*/
+		_jtag->set_state(Jtag::RUN_TEST_IDLE);
+		_jtag->toggleClk(2000);
+		/*
+		* 23: Move to the TLR state. The device is
+		* now functional.                                    X     1   3
+		*/
+		_jtag->go_test_logic_reset();
+		/* Some xc7s50 does not detect correct connected flash w/o this shift*/
+		_jtag->shiftIR(tx_buf, rx_buf, _irlen);
+		uint8_t ir_c = rx_buf[0] & 0x03;
+		uint8_t isc_done = ((rx_buf[0] >> 2) & 0x01);
+		uint8_t isc_ena  = ((rx_buf[0] >> 3) & 0x01);
+		uint8_t init     = ((rx_buf[0] >> 4) & 0x01);
+		uint8_t done     = ((rx_buf[0] >> 5) & 0x01);
+		printf("Shift IR %02x\n", rx_buf[0]);
+		printf("ir: %x isc_done %x isc_ena %x init %x done %x\n", ir_c, isc_done, isc_ena,
+			init, done);
+
+		if (!done) {
+			read_register("STAT");
+		}
+	}
+}
+
+static uint32_t char_array_to_word(uint8_t *in)
+{
+	return (((uint32_t)in[3] << 24) |
+		((uint32_t)in[2] << 16) |
+		((uint32_t)in[1] <<  8) |
+		((uint32_t)in[0] <<  0));
+}
+
+typedef struct {
+	std::string description;
+	uint8_t offset;
+	uint8_t size;
+	std::map<int, std::string> reg_cnt;
+} reg_struct_t;
+
+#define REG_ENTRY(_description, _offset, _size, ...) \
+	{_description, _offset, _size, {__VA_ARGS__}}
+
+static const std::map<std::string, std::list<reg_struct_t>> reg_content = {
+	{"CTRL0", std::list<reg_struct_t>{
+		REG_ENTRY("GTS USR B",       0, 1,
+			{0, "I/Os 3-stated"}, {1, "I/Os active"}),
+		REG_ENTRY("Reserved",        1, 2),
+		REG_ENTRY("PERSIST",         3, 1,
+			{0, "No"}, {1, "Yes"}),
+		REG_ENTRY("SBITS",           4, 2,
+			{0, "Read/Write OK"}, {1, "Readback disabled"},
+			{2, "Both Writes and Reads disabled"},
+			{3, "Both Writes and Reads disabled"}),
+		REG_ENTRY("DEC",             6, 1,
+			{0, "Disable"}, {1, "Enable"}),
+		REG_ENTRY("FARSRC",          7, 1),
+		REG_ENTRY("GLUMASK B",       8, 1),
+		REG_ENTRY("Reserved",        9, 1),
+		REG_ENTRY("ConfigFallback", 10, 1,
+			{0, "Disable"}, {1, "Enable"}),
+		REG_ENTRY("Reserved",       11, 1),
+		REG_ENTRY("OverTempPwrDown", 12, 1,
+			{0, "Disable"}, {1, "Enable"}),
+		REG_ENTRY("Reserved",       13, 17),
+		REG_ENTRY("ICAP Select",    30, 1,
+			{0, "Top ICAPE2 Port Enabled"},
+			{1, "Bottom ICAPE2 Port Enabled"}),
+		REG_ENTRY("EFUSE key",      31, 1,
+			{0, "Battery backed RAM"}, {1, "eFUSE"}),
+	}},
+	// UG470 Table 5-40
+	{"CTRL1", std::list<reg_struct_t>{
+		REG_ENTRY("Reserved",  0, 32),
+	}},
+	{"STAT", std::list<reg_struct_t>{
+		REG_ENTRY("CRC Error",       0, 1,
+			{0, "No CRC error"}, {1, "CRC error"}),
+		REG_ENTRY("Part Secured",    1, 1),
+		REG_ENTRY("MMCM lock",       2, 1),
+		REG_ENTRY("DCI match",       3, 1),
+		REG_ENTRY("EOS",             4, 1),
+		REG_ENTRY("GTS CFG B",       5, 1),
+		REG_ENTRY("GWE",             6, 1),
+		REG_ENTRY("GHIGH B",         7, 1),
+		REG_ENTRY("MODE",            8, 3),
+		REG_ENTRY("INIT Complete",  11, 1),
+		REG_ENTRY("INIT B",         12, 1),
+		REG_ENTRY("Release Done",   13, 1),
+		REG_ENTRY("Done",           14, 1),
+		REG_ENTRY("ID Error",       15, 1,
+			{0, "No ID error"}, {1, "ID error"}),
+		REG_ENTRY("DEC Error",      16, 1),
+		REG_ENTRY("XADC Over temp", 17, 1),
+		REG_ENTRY("STARTUP State",  18, 3),
+		REG_ENTRY("Reserved",       21, 4),
+		REG_ENTRY("BUS Width",      25, 2,
+			{0, "x1"}, {1, "x8"}, {2, "x16"}, {3, "x32"}),
+		REG_ENTRY("Reserved",       27, 5)
+	}},
+	// UG470 Table 5-34
+	{"WBSTAR", std::list<reg_struct_t>{
+		// Next bitstream start address. The default start address
+		//   is address zero.
+		REG_ENTRY("START ADDR",  0, 29),
+		REG_ENTRY("RS TS B",    29, 1,
+			{0, "3-state enabled (RS[1:0] disabled) (default)"},
+			{1, "3-state disabled (RS[1:0] enabled)"},
+		),
+		// RS[1:0] pin value on next warm boot. The default is 00.
+		REG_ENTRY("RS[1:0]",    30, 2),
+	}},
+	// UG470 Table 5-39
+	{"BOOTSTS", std::list<reg_struct_t>{
+		// Status 0 is valid
+		REG_ENTRY("VALID 0",       0, 1),
+		REG_ENTRY("FALLBACK 0",    1, 1,
+			{0, "Normal configuration"},
+			{1, "Fallback to default reconfiguration, RS[1:0] actively drives 2'b00"}
+		),
+		// Internal PROG triggered configuration
+		REG_ENTRY("IPROG 0",       2, 1),
+		// Watchdog time-out error
+		REG_ENTRY("WTO Error 0",   3, 1),
+		// ID_CODE error
+		REG_ENTRY("ID Error 0",    4, 1),
+		// CRC error
+		REG_ENTRY("CRC Error 0",   5, 1),
+		// BPI address counter wraparound error, supported in
+		//   asynchronous read mode
+		REG_ENTRY("WRAP Error 0",  6, 1),
+		// HMAC error
+		REG_ENTRY("HMAC Error 0",  7, 1),
+		REG_ENTRY("VALID 1",       8, 1),
+		REG_ENTRY("FALLBACK 1",    9, 1,
+			{0, "Normal configuration"},
+			{1, "Fallback to default reconfiguration, RS[1:0] actively drives 2'b00"}
+		),
+		REG_ENTRY("IPROG 1",      10, 1),
+		REG_ENTRY("WTO Error 1",  11, 1),
+		REG_ENTRY("ID Error 1",   12, 1),
+		REG_ENTRY("CRC Error 1",  13, 1),
+		REG_ENTRY("WRAP Error 1", 14, 1),
+		REG_ENTRY("HMAC Error 1", 15, 1),
+	}},
+};
+
+/* UG470 table 5-23 */
+static const std::map<std::string, uint8_t> reg_code = {
+	{"CTRL0",   0x05},  // Control register 0
+	{"STAT",    0x07},  // Status register
+	{"CONF0",   0x09},  // Configuration Option 0
+	{"CONF1",   0x0e},  // Configuration Option 1
+	{"WBSTAR",  0x10},  // Warm Boot Start Address Register
+	{"BOOTSTS", 0x16},  // Boot history status register
+	{"CTRL1",   0x18},  // Control register 1
+};
+
+uint32_t Xilinx::dumpRegister(std::string reg_name)
+{
+	uint8_t reg[4];
+	const uint8_t dummy[] = {0x00, 0x00, 0x00, 0x04};
+	/* opcode:
+	 * 0x0: NOP
+	 * 0x1: read
+	 * 0x2: write
+	 * 0x3: Reserved
 	 */
-	_jtag->shiftIR(JSTART, 6, Jtag::UPDATE_IR);
-	/*
-	 * 22: Move to the RTI state and clock the
-	 *     startup sequence by applying a minimum         X     0   2000
-	 *     of 2000 clock cycles to the TCK.
+	/* register code
+	 * 0x05: Control register 0
+	 * 0x07: Status register
+	 * 0x09: Configuration Option 0
+	 * 0x0e: Configuration Option 1
+	 * 0x18: Control Register 1
+	 * 0x16: Boot history Status register
 	 */
-	_jtag->set_state(Jtag::RUN_TEST_IDLE);
-	_jtag->toggleClk(2000);
-	/*
-	 * 23: Move to the TLR state. The device is
-	 * now functional.                                    X     1   3
-	 */
+	auto code = reg_code.find(reg_name);
+	if (code == reg_code.end()) {
+		printError("Unknown register " + reg_name);
+		printError("Known Register are:");
+		for (auto reg : reg_code)
+			printError("\t" + reg.first);
+		return 0xdeadbeef;
+	}
+
+	/* packet type 1 */
+	const uint32_t regcode = static_cast<uint32_t>(code->second);
+	uint32_t cfg_packets[] = {
+		0xAA995566,  // Sync Word
+		0x20000000,  // NOOP
+		((0x01    & 0x0007) << 29) |  // [31:29]: Header type
+		((0x01    & 0x0003) << 27) |  // [28:27]: opcode
+		((regcode & 0x3fff) << 13) |  // [26:13]: register code
+		((0x00    & 0x0003) << 11) |  // [12:11]: Reserved must be set to 0
+		((0x01    & 0x07ff) <<  0),   // [10:0 ]: word count
+		0x20000000,  // NOOP
+		0x20000000,  // NOOP
+	};
+
 	_jtag->go_test_logic_reset();
+	_jtag->set_state(Jtag::RUN_TEST_IDLE);
+	_jtag->shiftIR(get_ircode(_ircode_map, "CFG_IN"), NULL, _irlen, Jtag::SELECT_DR_SCAN);
+
+	Jtag::tapState_t next_state = Jtag::SHIFT_DR;
+	for (int i = 0; i < 5; i++) {
+		if (i == 4)
+			next_state = Jtag::SELECT_IR_SCAN;
+		const uint32_t tmp = BitParser::reverse_32(cfg_packets[i]);
+		const uint8_t cfg[] = {
+			static_cast<uint8_t>((tmp >>  0) & 0xff),
+			static_cast<uint8_t>((tmp >>  8) & 0xff),
+			static_cast<uint8_t>((tmp >> 16) & 0xff),
+			static_cast<uint8_t>((tmp >> 24) & 0xff)
+		};
+
+		_jtag->shiftDR(cfg, NULL, 32, next_state);
+	}
+
+	_jtag->shiftIR(get_ircode(_ircode_map, "CFG_OUT"), NULL, _irlen, Jtag::SELECT_DR_SCAN);
+	_jtag->shiftDR(dummy, reg, 32);
+	_jtag->go_test_logic_reset();
+
+	uint32_t reg_word = char_array_to_word(reg);
+	reg_word = BitParser::reverse_32(reg_word);
+	return reg_word;
+}
+
+void Xilinx::displayRegister(const std::string reg_name, const uint32_t reg_val) {
+	auto reg = reg_content.find(reg_name);
+	if (reg == reg_content.end()) {
+		printError("Unknown register " + reg_name);
+		return;
+	}
+
+	std::stringstream raw_val;
+	raw_val << "0x" << std::hex << reg_val;
+	printSuccess("Register raw value: " + raw_val.str());
+
+	const std::list<reg_struct_t> regs = reg->second;
+	for (reg_struct_t r: regs) {
+		uint8_t offset = r.offset;
+		uint8_t size = r.size;
+		uint32_t val = (size == 32) ? reg_val : ((reg_val >> offset) & ((1 << size) - 1));
+		std::stringstream ss, desc;
+		desc << r.description;
+		ss << std::setw(16) << std::left << r.description;
+		if (r.reg_cnt.size() != 0) {
+			ss << r.reg_cnt[val];
+		} else {
+			std::stringstream hex_val;
+			hex_val << "0x" << std::hex << val;
+			ss << hex_val.str();
+		}
+
+		printInfo(ss.str());
+	}
 }
 
 bool Xilinx::dumpFlash(uint32_t base_addr, uint32_t len)
 {
+	/* BPI parallel NOR dump (added: upstream dumpFlash lacks a BPI path) */
+	if (_is_bpi_board)
+		return dumpFlash_bpi(base_addr, len);
+
 	if (_fpga_family == XC95_FAMILY || _fpga_family == XCF_FAMILY) {
 		std::string buffer;
 		if (_fpga_family == XC95_FAMILY) {
@@ -480,30 +1368,227 @@ bool Xilinx::dumpFlash(uint32_t base_addr, uint32_t len)
 		return true;
 	}
 
-	/* dump SPI Flash */
-	return SPIInterface::dump(base_addr, len);
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		FlashInterface::set_filename(_filename);
+		if (!FlashInterface::dump(base_addr, len))
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		FlashInterface::set_filename(_secondary_filename);
+		if (!FlashInterface::dump(base_addr, len))
+			return false;
+	}
+
+	return true;
 }
 
-/*                                */
-/* internal flash (xc95)          */
-/* based on ISE xx_1532.bsd files */
-/*                                */
+bool Xilinx::detect_flash()
+{
+	if (_is_bpi_board) {
+		if (!_bpi_flash) {
+			if (!load_bpi_bridge())
+				return false;
+		}
+		if (!_bpi_flash->detect()) {
+			printError("BPI flash detection failed");
+				return false;
+		}
+		return post_flash_access();
+	}
+
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		if (!FlashInterface::detect_flash())
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		if (!FlashInterface::detect_flash())
+			return false;
+	}
+	return true;
+}
+
+bool Xilinx::protect_flash(uint32_t len)
+{
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		if (!FlashInterface::protect_flash(len))
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		if (!FlashInterface::protect_flash(len))
+			return false;
+	}
+	return true;
+}
+
+bool Xilinx::unprotect_flash()
+{
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		if (!FlashInterface::unprotect_flash())
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		if (!FlashInterface::unprotect_flash())
+			return false;
+	}
+	return true;
+}
+
+bool Xilinx::set_quad_bit(bool set_quad)
+{
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		if (!FlashInterface::set_quad_bit(set_quad))
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		if (!FlashInterface::set_quad_bit(set_quad))
+			return false;
+	}
+	return true;
+}
+
+bool Xilinx::bulk_erase_flash()
+{
+	if (_flash_chips & PRIMARY_FLASH) {
+		select_flash_chip(PRIMARY_FLASH);
+		if (!FlashInterface::bulk_erase_flash())
+			return false;
+	}
+	if (_flash_chips & SECONDARY_FLASH) {
+		select_flash_chip(SECONDARY_FLASH);
+		if (!FlashInterface::bulk_erase_flash())
+			return false;
+	}
+	return true;
+}
+
+/* flow program for xc3s (legacy mode)          */
+/* based on ISE spartan3/data/xx_1532.bsd files */
+/*                                              */
+
+bool Xilinx::xc3s_flow_program(ConfigBitstreamParser *bit)
+{
+	int byte_length = bit->getLength() / 8;
+	int burst_len = byte_length / 100;
+	const uint8_t *data = bit->getData();
+	int tx_len = burst_len * 8;
+	Jtag::tapState_t tx_end = Jtag::SHIFT_DR;
+	ProgressBar progress("Load SRAM", byte_length, 50, _quiet);
+
+	flow_enable();
+
+	if (_jtag->shiftIR(JPROGRAM, _irlen) < 0)
+		return false;
+
+	/* wait until memory cleared (DS099 v3.1 fig.30 p.52) */
+	uint8_t tx_buf = BYPASS, rx_buf;
+	do {
+		if (_jtag->shiftIR(&tx_buf, &rx_buf, _irlen) < 0)
+			return false;
+	} while (!(rx_buf & 0x10));  // wait until INIT
+
+	if (_jtag->shiftIR(JSHUTDOWN, _irlen) < 0)
+		return false;
+	_jtag->toggleClk(16);
+	if (_jtag->shiftIR(CFG_IN, _irlen) < 0)
+		return false;
+
+	for (int i = 0; byte_length > 0; byte_length-=burst_len, data+=burst_len) {
+		if (burst_len > byte_length) {
+			tx_len = byte_length * 8;
+			tx_end = Jtag::RUN_TEST_IDLE;
+		}
+		if (_jtag->shiftDR(data, NULL, tx_len, tx_end) < 0) {
+			progress.fail();
+			return false;
+		}
+		_jtag->flush();
+		progress.display(i);
+		i+= burst_len;
+	}
+	progress.done();
+	_jtag->toggleClk(1);
+	if (_jtag->shiftIR(JSTART, _irlen) < 0)
+		return false;
+	_jtag->toggleClk(32);
+	if (_jtag->shiftIR(BYPASS, _irlen) < 0)
+		return false;
+	uint8_t d = 0;
+	if (_jtag->shiftDR(&d, NULL, 1) < 0)
+		return false;
+	_jtag->toggleClk(1);
+
+	flow_disable();
+	uint8_t mask = 0x20;  // Done bit
+	uint32_t idcode = _jtag->get_target_device_id();
+	if (fpga_list[idcode].family == "spartan3e") {
+		mask = 0x10;  // ISC done dit
+	}
+	int retry = 100;
+	do {
+		if (_jtag->shiftIR(&tx_buf, &rx_buf, _irlen) < 0)
+			return false;
+		if (_jtag->shiftDR(data, NULL, 1) < 0)
+			return false;
+	} while (!(rx_buf & mask) && (retry-- > 0));  // wait until mask
+
+	return true;
+}
 
 void Xilinx::flow_enable()
 {
 	uint8_t xfer_buf = 0x15;
-	_jtag->shiftIR(XC95_ISC_ENABLE, 8);
-	_jtag->shiftDR(&xfer_buf, NULL, 6);
-	_jtag->toggleClk(1);
+	uint8_t isc_enable = XC95_ISC_ENABLE;
+	int drlen = 6, tcklen = 1;
+	if (_fpga_family == SPARTAN3_FAMILY) {
+		xfer_buf = 0x00;
+		isc_enable = ISC_ENABLE;
+		drlen = 5;
+		tcklen = 16;
+	}
+	if (_jtag->shiftIR(isc_enable, _irlen) < 0)
+		return;
+	if (_jtag->shiftDR(&xfer_buf, NULL, drlen) < 0)
+		return;
+	_jtag->toggleClk(tcklen);
 }
 
 void Xilinx::flow_disable()
 {
-	_jtag->shiftIR(XC95_ISC_DISABLE, 8);
-	_jtag->toggleClk((_jtag->getClkFreq() * 100) / 1000000);
-	_jtag->shiftIR(BYPASS, 8);
+	uint8_t isc_disable = XC95_ISC_DISABLE;
+	int tcklen = ((_jtag->getClkFreq() * 100) / 1000000);
+
+	if (_fpga_family == SPARTAN3_FAMILY) {
+		isc_disable = ISC_DISABLE;
+		tcklen = 16;
+	}
+
+	if (_jtag->shiftIR(isc_disable, _irlen) < 0)
+		return;
+	_jtag->toggleClk(tcklen);
+	if (_jtag->shiftIR(BYPASS, _irlen) < 0)
+		return;
+	if (_fpga_family == SPARTAN3_FAMILY) {
+		uint8_t xfer_buf = 0;
+		if (_jtag->shiftDR(&xfer_buf, NULL, 1) < 0)
+			return;
+	}
 	_jtag->toggleClk(1);
 }
+
+/*                                              */
+/* internal flash (xc95)                        */
+/* based on ISE xc9500yy/data/xx_1532.bsd files */
+/*                                              */
 
 bool Xilinx::flow_erase()
 {
@@ -573,7 +1658,7 @@ bool Xilinx::flow_program(JedParser *jed)
 			_jtag->shiftDR(wr_buf, NULL, 8 * (_xc95_line_len + 2));
 
 			if (ii == 14)
-				_jtag->toggleClk(20000);
+				_jtag->toggleClk((_jtag->getClkFreq() * 50) / 1000);
 			else
 				_jtag->toggleClk(1);
 
@@ -606,7 +1691,7 @@ bool Xilinx::flow_program(JedParser *jed)
 		std::string flash = flow_read();
 		int flash_pos = 0;
 		ProgressBar progress2("Verify Flash", nb_section, 50, _quiet);
-		for (size_t section = 0; section < 108; section++) {
+		for (size_t section = 0; section < nb_section; section++) {
 			for (size_t subsection = 0; subsection < 15; subsection++) {
 				int id = section * 15 + subsection;
 				std::string content = jed->data_for_section(id)[0];
@@ -639,7 +1724,7 @@ std::string Xilinx::flow_read()
 	std::string buffer;
 	uint8_t wr_buf[16+2];  // largest section length
 	uint8_t rd_buf[16+2];
-	memset(wr_buf, 0xff, 16);
+	memset(wr_buf, 0xff, sizeof(wr_buf));
 
 	/* limit JTAG clock frequency to 1MHz */
 	if (_jtag->getClkFreq() > 1e6)
@@ -699,6 +1784,7 @@ void Xilinx::xcf_flow_enable(uint8_t mode)
 void Xilinx::xcf_flow_disable()
 {
 	_jtag->shiftIR(XCF_ISC_DISABLE, 8);
+	_jtag->flush();
 	usleep(110000);
 	_jtag->shiftIR(BYPASS, 8);
 	_jtag->toggleClk(1);
@@ -716,11 +1802,13 @@ bool Xilinx::xcf_flow_erase()
 	_jtag->toggleClk(1);
 
 	_jtag->shiftIR(XCF_ISC_ERASE, 8);
+	_jtag->flush();
 	usleep(500000);
 
 	int i;
 	for (i = 0; i < 32; i++) {
 		_jtag->shiftIR(XCF_ISCTESTSTATUS, 8);
+		_jtag->flush();
 		usleep(500000);
 		_jtag->shiftDR(NULL, xfer_buf, 8);
 		if ((xfer_buf[0] & 0x04))
@@ -744,11 +1832,13 @@ bool Xilinx::xcf_program(ConfigBitstreamParser *bitfile)
 	uint8_t tx_buf[4096 / 8];
 	uint16_t pkt_len =
 		((_jtag->get_target_device_id() == 0x05044093) ? 2048 : 4096) / 8;
-	uint8_t *data = bitfile->getData();
+	if (!bitfile)
+		throw std::runtime_error("called with null bitstream");
+	const uint8_t *data = bitfile->getData();
 	uint32_t data_len = bitfile->getLength() / 8;
 	uint32_t xfer_len, offset = 0;
 	uint32_t addr = 0;
-	int xfer_end;
+	Jtag::tapState_t xfer_end;
 
 	/* limit JTAG clock frequency to 15MHz */
 	if (_jtag->getClkFreq() > 15e6)
@@ -794,12 +1884,14 @@ bool Xilinx::xcf_program(ConfigBitstreamParser *bitfile)
 
 		/* send program instruction */
 		_jtag->shiftIR(XCF_ISC_PROGRAM, 8);
+		_jtag->flush();
 		usleep((addr == 0) ? 14000: 500);
 
 		/* wait until bit 3 != 1 */
 		int i;
 		for (i = 0; i < 29; i++) {
 			_jtag->shiftIR(XCF_ISCTESTSTATUS, 8);
+			_jtag->flush();
 			usleep(500);
 			_jtag->shiftDR(NULL, tx_buf, 8);
 			if ((tx_buf[0] & 0x04))
@@ -887,6 +1979,7 @@ std::string Xilinx::xcf_read()
 
 		/* send data to PROM */
 		_jtag->shiftIR(XCF_ISC_READ, 8);
+		_jtag->flush();
 		usleep(50);
 		_jtag->shiftDR(NULL, rx_buf, pkt_len * 8);
 
@@ -958,10 +2051,13 @@ static constexpr uint8_t _gray_code[256] = {
 void Xilinx::xc2c_init(uint32_t idcode)
 {
 	_fpga_family = XC2C_FAMILY;
-	std::string model = fpga_list[idcode].model;
-	int underscore_pos = model.find_first_of('_', 0);
-	snprintf(_cpld_base_name, underscore_pos,
-			"%s", model.substr(0, underscore_pos).c_str());
+
+	const std::string model = fpga_list[idcode].model;
+	const size_t underscore_pos = model.find('_');
+	const std::string base_name = model.substr(0, underscore_pos);
+
+	snprintf(_cpld_base_name, sizeof(_cpld_base_name),
+			"%s", base_name.c_str());
 	switch ((idcode >> 16) & 0x3f) {
 	case 0x01: /* xc2c32 */
 	case 0x11: /* xc2c32a PC44 */
@@ -1098,7 +2194,6 @@ std::string Xilinx::xc2c_flow_read()
 
 bool Xilinx::xc2c_flow_program(JedParser *jed)
 {
-	uint8_t wr_buf[249];  // largest section length
 	uint32_t delay_loop = (_jtag->getClkFreq() * 20) / 1000;
 	uint8_t shift_addr = 8 - _cpld_addr_size;
 
@@ -1134,9 +2229,10 @@ bool Xilinx::xc2c_flow_program(JedParser *jed)
 	_jtag->shiftIR(XC2C_ISC_PROGRAM, 8);
 
 	uint16_t iter = 0;
-	for (auto row : listfuse) {
+	for (const auto &row : listfuse) {
 		uint16_t pos = 0;
 		uint8_t addr = _gray_code[iter] >> shift_addr;
+		uint8_t wr_buf[249] = {0};  // largest section length
 		for (auto col : row) {
 			if (col)
 				wr_buf[pos >> 3] |= (1 << (pos & 0x07));
@@ -1159,7 +2255,7 @@ bool Xilinx::xc2c_flow_program(JedParser *jed)
 	if (_verify) {
 		std::string rx_buffer = xc2c_flow_read();
 		iter = 0;
-		for (auto row : listfuse) {
+		for (const auto &row : listfuse) {
 			for (auto col : row) {
 				if ((rx_buffer[iter >> 3] >> (iter & 0x07)) != col) {
 					throw std::runtime_error("Program: verify failed");
@@ -1188,8 +2284,12 @@ bool Xilinx::xc2c_flow_program(JedParser *jed)
  *        so to send only a cmd set len to 0 (or omit this param)
  */
 int Xilinx::spi_put(uint8_t cmd,
-			uint8_t *tx, uint8_t *rx, uint32_t len)
+			const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
+	/* SpiOverJtag v2 */
+	if (_soj_is_v2)
+		return spi_put_v2(cmd, tx, rx, len);
+
 	int xfer_len = len + 1 + ((rx == NULL) ? 0 : 1);
 	uint8_t jtx[xfer_len];
 	jtx[0] = McsParser::reverseByte(cmd);
@@ -1200,7 +2300,7 @@ int Xilinx::spi_put(uint8_t cmd,
 			jtx[i+1] = McsParser::reverseByte(tx[i]);
 	}
 	/* addr BSCAN user1 */
-	_jtag->shiftIR(USER1, 6);
+	_jtag->shiftIR(get_ircode(_ircode_map, _user_instruction), NULL, _irlen);
 	/* send first already stored cmd,
 	 * in the same time store each byte
 	 * to next
@@ -1214,7 +2314,7 @@ int Xilinx::spi_put(uint8_t cmd,
 	return 0;
 }
 
-int Xilinx::spi_put(uint8_t *tx, uint8_t *rx, uint32_t len)
+int Xilinx::spi_put(const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
 	int xfer_len = len + ((rx == NULL) ? 0 : 1);
 	uint8_t jtx[xfer_len];
@@ -1224,7 +2324,7 @@ int Xilinx::spi_put(uint8_t *tx, uint8_t *rx, uint32_t len)
 			jtx[i] = McsParser::reverseByte(tx[i]);
 	}
 	/* addr BSCAN user1 */
-	_jtag->shiftIR(USER1, 6);
+	_jtag->shiftIR(get_ircode(_ircode_map, _user_instruction), NULL, _irlen);
 	/* send first already stored cmd,
 	 * in the same time store each byte
 	 * to next
@@ -1242,27 +2342,37 @@ int Xilinx::spi_wait(uint8_t cmd, uint8_t mask, uint8_t cond,
 			uint32_t timeout, bool verbose)
 {
 	uint8_t rx[2];
-	uint8_t dummy[2];
+	uint8_t tx[2];
 	uint8_t tmp;
-	uint8_t tx = McsParser::reverseByte(cmd);
 	uint32_t count = 0;
+	const uint8_t shift = _jtag_chain_len;
+	uint8_t idx = 0;
 
-	_jtag->shiftIR(USER1, 6, Jtag::UPDATE_IR);
-	_jtag->shiftDR(&tx, NULL, 8, Jtag::SHIFT_DR);
+	if (_soj_is_v2)
+		tx[idx++] = (0x2 << 1) | 1;
+	tx[idx++] = McsParser::reverseByte(cmd);
+
+	_jtag->shiftIR(get_ircode(_ircode_map, _user_instruction), NULL, _irlen, Jtag::UPDATE_IR);
+	_jtag->shiftDR(tx, NULL, 8 * idx, Jtag::SHIFT_DR);
 
 	do {
-		_jtag->shiftDR(dummy, rx, 8*2, Jtag::SHIFT_DR);
-		tmp = (McsParser::reverseByte(rx[0]>>1)) | (0x01 & rx[1]);
+		_jtag->shiftDR(tx, rx, 8*2, Jtag::SHIFT_DR);
+		tmp = McsParser::reverseByte(rx[0 ]>> shift);
+		if (shift == 1)
+			tmp |= (0x01 & rx[1]);
+		else
+			tmp |= McsParser::reverseByte(rx[1]) >> (8 - shift);
+
 		count++;
 		if (count == timeout){
 			printf("timeout: %x %x %x\n", tmp, rx[0], rx[1]);
 			break;
 		}
 		if (verbose) {
-			printf("%x %x %x %u\n", tmp, mask, cond, count);
+			printf("%x %x %x %u %02x %02x\n", tmp, mask, cond, count, rx[0], rx[1]);
 		}
 	} while ((tmp & mask) != cond);
-	_jtag->shiftDR(dummy, rx, 8*2, Jtag::EXIT1_DR);
+	_jtag->shiftDR(tx, rx, 8 * 2, Jtag::EXIT1_DR);
 	_jtag->go_test_logic_reset();
 
 	if (count == timeout) {
@@ -1271,5 +2381,86 @@ int Xilinx::spi_wait(uint8_t cmd, uint8_t mask, uint8_t cond,
 		return -ETIME;
 	} else {
 		return 0;
+	}
+}
+
+int Xilinx::spi_put_v2(uint8_t cmd, const uint8_t *tx, uint8_t *rx,
+		uint32_t len)
+{
+	const uint32_t real_len = len + 1;  // rx/tx length + cmd
+	uint32_t kPktLen = real_len + 2;  // One header and +1 due to the needs of an additional bit/byte
+	uint8_t mode = 0x01;
+	if (real_len > 32) {
+		kPktLen++;  // Additional header
+		mode = 0x00;
+	}
+
+	const uint32_t xfer_bit_len = (kPktLen - 1) * 8 + (rx ? 8 : 1);
+
+	uint8_t jrx[kPktLen];
+	uint8_t pkt[kPktLen];
+	uint32_t idx = 0;
+
+	pkt[idx++] = ((0x1f & real_len) << 3) | ((0x03 & mode) << 1) | 1;
+	if (mode == 0x00)
+		pkt[idx++] = 0xff & (real_len >> 5);
+
+	pkt[idx++] = McsParser::reverseByte(cmd);
+	if (tx) {
+		for (uint32_t i=0; i < len; i++)
+			pkt[idx++] = McsParser::reverseByte(tx[i]);
+	} else {
+		memset(&pkt[idx], 0, len);
+		idx += len;
+	}
+
+	/* addr BSCAN user1 */
+	_jtag->shiftIR(get_ircode(_ircode_map, _user_instruction), NULL, _irlen);
+	_jtag->shiftDR(pkt, (rx == NULL) ? NULL : jrx, xfer_bit_len);
+	_jtag->go_test_logic_reset();
+	_jtag->flush();
+
+	if (_verbose) {
+		for (uint32_t i = 0; i < kPktLen; i++)
+			printf("%02x ", pkt[i]);
+		printf("\n");
+	}
+
+	if (rx != NULL) {
+		if (_verbose) {
+			for (uint32_t i = 0; i < kPktLen; i++)
+				printf("%02x ", jrx[i]);
+			printf("\n");
+			for (uint32_t i = 0; i < kPktLen; i++)
+				printf("%02x ", McsParser::reverseByte(jrx[i]));
+			printf("\n");
+		}
+		idx = (mode == 0 ? 3 : 2);
+		const uint8_t shift = _jtag_chain_len;
+		for (uint32_t i = 0; i < len; i++) {
+			rx[i] = McsParser::reverseByte(jrx[i + idx] >> shift);
+			if (shift == 1)
+				rx[i] |= (jrx[i + idx + 1] & 0x01);
+			else
+				rx[i] |= McsParser::reverseByte(jrx[i + idx + 1]) >> (8 - shift);
+			if (_verbose)
+				printf("%02x ", rx[i]);
+		}
+		if (_verbose)
+			printf("\n");
+	}
+
+	return 0;
+}
+
+void Xilinx::select_flash_chip(xilinx_flash_chip_t flash_chip) {
+	switch (flash_chip) {
+	case SECONDARY_FLASH:
+		_user_instruction = "USER2";
+		break;
+	case PRIMARY_FLASH:
+	default:
+		_user_instruction = "USER1";
+		break;
 	}
 }

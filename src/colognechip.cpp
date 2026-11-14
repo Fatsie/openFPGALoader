@@ -6,20 +6,24 @@
 
 #include "colognechip.hpp"
 
+#include <memory>
+#include <string.h>
+
 #define JTAG_CONFIGURE  0x06
 #define JTAG_SPI_BYPASS 0x05
 #define SLEEP_US 500
 
 CologneChip::CologneChip(FtdiSpi *spi, const std::string &filename,
 	const std::string &file_type, Device::prog_type_t prg_type,
-	uint16_t rstn_pin, uint16_t done_pin, uint16_t failn_pin, uint16_t oen_pin,
+	uint16_t rstn_pin, uint16_t done_pin, uint16_t fail_pin, uint16_t oen_pin,
 	bool verify, int8_t verbose) :
 	Device(NULL, filename, file_type, verify, verbose), _rstn_pin(rstn_pin),
-		_done_pin(done_pin), _failn_pin(failn_pin), _oen_pin(oen_pin)
+		_done_pin(done_pin), _fail_pin(fail_pin), _oen_pin(oen_pin)
 {
 	_spi = spi;
-	_spi->gpio_set_input(_done_pin | _failn_pin);
+	_spi->gpio_set_input(_done_pin | _fail_pin);
 	_spi->gpio_set_output(_rstn_pin | _oen_pin);
+	_ftdi_jtag = nullptr;
 
 	if (prg_type == Device::WR_SRAM) {
 		_mode = Device::MEM_MODE;
@@ -34,27 +38,42 @@ CologneChip::CologneChip(Jtag* jtag, const std::string &filename,
 	bool verify, int8_t verbose) :
 	Device(jtag, filename, file_type, verify, verbose)
 {
+	_spi = nullptr;
+
 	/* check which cable/board we're using in order to select pin definitions */
-	std::string spi_board_name;
-	if (board_name != "-") {
-		spi_board_name = std::regex_replace(board_name, std::regex("jtag"), "spi");
+	std::string ftdi_board_name;
+	if ((board_name != "-") && (cable_name != "dirtyJtag")) {
+		ftdi_board_name = std::regex_replace(board_name, std::regex("jtag"), "spi");
 	} else if (cable_name == "gatemate_pgm") {
-		spi_board_name = "gatemate_pgm_spi";
+		ftdi_board_name = "gatemate_pgm_spi";
+	} else if (cable_name == "dirtyJtag") {
+#ifdef ENABLE_DIRTYJTAG
+		_dirtyjtag = reinterpret_cast<DirtyJtag *>(_jtag->_jtag);
+		_rstn_pin = (1 << 6);
+		_done_pin = 0;
+		_fail_pin = 0;
+		_oen_pin  = 0;
+#else
+		std::cerr << "Jtag: support for dirtyJtag cable was not enabled at compile time" << std::endl;
+		throw std::exception();
+#endif
 	}
 
-	target_board_t *spi_board = &(board_list[spi_board_name]);
+	if (ftdi_board_name != "") {
+		target_board_t *board = &(board_list[ftdi_board_name]);
 
-	/* pin configurations valid for both evaluation board and programer */
-	_rstn_pin  = spi_board->reset_pin;
-	_done_pin  = spi_board->done_pin;
-	_failn_pin = DBUS6;
-	_oen_pin   = spi_board->oe_pin;
+		/* pin configurations valid for both evaluation board and programmer */
+		_rstn_pin  = board->reset_pin;
+		_done_pin  = board->done_pin;
+		_fail_pin = DBUS6;
+		_oen_pin   = board->oe_pin;
 
-	/* cast _jtag->_jtag from JtagInterface to FtdiJtagMPSSE to access GPIO */
-	_ftdi_jtag = reinterpret_cast<FtdiJtagMPSSE *>(_jtag->_jtag);
+		/* cast _jtag->_jtag from JtagInterface to FtdiJtagMPSSE to access GPIO */
+		_ftdi_jtag = reinterpret_cast<FtdiJtagMPSSE *>(_jtag->_jtag);
 
-	_ftdi_jtag->gpio_set_input(_done_pin | _failn_pin);
-	_ftdi_jtag->gpio_set_output(_rstn_pin | _oen_pin);
+		_ftdi_jtag->gpio_set_input(_done_pin | _fail_pin);
+		_ftdi_jtag->gpio_set_output(_rstn_pin | _oen_pin);
+	}
 
 	if (prg_type == Device::WR_SRAM) {
 		_mode = Device::MEM_MODE;
@@ -76,12 +95,18 @@ void CologneChip::reset()
 		_ftdi_jtag->gpio_clear(_rstn_pin | _oen_pin);
 		usleep(SLEEP_US);
 		_ftdi_jtag->gpio_set(_rstn_pin);
+#ifdef ENABLE_DIRTYJTAG
+	} else if (_dirtyjtag) {
+		_dirtyjtag->gpio_clear(_rstn_pin);
+		_dirtyjtag->gpio_set(_rstn_pin);
+		usleep(2 * SLEEP_US); // 2x because it fails with windows
+#endif
 	}
 }
 
 /**
- * Obtain CFG_DONE and ~CFG_FAILED signals. Configuration is successfull iff
- * CFG_DONE=true and ~CFG_FAILED=false.
+ * Obtain CFG_DONE and CFG_FAILED signals. Configuration is successful if
+ * CFG_DONE=true and CFG_FAILED=false.
  */
 bool CologneChip::cfgDone()
 {
@@ -92,12 +117,12 @@ bool CologneChip::cfgDone()
 		status = _ftdi_jtag->gpio_get(true);
 	}
 	bool done = (status & _done_pin) > 0;
-	bool fail = (status & _failn_pin) == 0;
+	bool fail = (status & _fail_pin) > 0;
 	return (done && !fail);
 }
 
 /**
- * Prints information if configuration was successfull.
+ * Prints information if configuration was successful.
  */
 void CologneChip::waitCfgDone()
 {
@@ -115,11 +140,7 @@ void CologneChip::waitCfgDone()
 	}
 }
 
-/**
- * Dump flash contents to file. Works in both SPI and JTAG-SPI-bypass mode.
- */
-bool CologneChip::dumpFlash(const std::string &filename, uint32_t base_addr,
-	uint32_t len)
+bool CologneChip::prepare_flash_access()
 {
 	if (_spi) {
 		/* enable output and hold reset */
@@ -128,27 +149,19 @@ bool CologneChip::dumpFlash(const std::string &filename, uint32_t base_addr,
 		/* enable output and disable reset */
 		_ftdi_jtag->gpio_clear(_oen_pin);
 		_ftdi_jtag->gpio_set(_rstn_pin);
+#ifdef ENABLE_DIRTYJTAG
+	} else if (_dirtyjtag) {
+		_dirtyjtag->gpio_clear(_rstn_pin);
+		_dirtyjtag->gpio_set(_rstn_pin);
+		usleep(SLEEP_US);
+#endif
 	}
 
-	/* prepare SPI access */
-	printInfo("Read Flash ", false);
-	try {
-		SPIFlash *flash;
-		if (_spi) {
-			flash = new SPIFlash(reinterpret_cast<SPIInterface *>(_spi), false,
-					_verbose);
-		} else if (_ftdi_jtag) {
-			flash = new SPIFlash(this, false, _verbose);
-		}
-		flash->reset();
-		flash->power_up();
-		flash->dump(filename, base_addr, len);
-	} catch (std::exception &e) {
-		printError("Fail");
-		printError(std::string(e.what()));
-		return false;
-	}
+	return true;
+}
 
+bool CologneChip::post_flash_access()
+{
 	if (_spi) {
 		/* disable output and release reset */
 		_spi->gpio_set(_rstn_pin | _oen_pin);
@@ -157,6 +170,78 @@ bool CologneChip::dumpFlash(const std::string &filename, uint32_t base_addr,
 		_ftdi_jtag->gpio_set(_oen_pin);
 	}
 	usleep(SLEEP_US);
+	reset();
+
+	return true;
+}
+
+/**
+ * Dump flash contents to file. Works in both SPI and JTAG-SPI-bypass mode.
+ */
+bool CologneChip::detect_flash()
+{
+	/* prepare SPI access */
+	prepare_flash_access();
+
+	printInfo("Read Flash ", false);
+	try {
+		std::unique_ptr<SPIFlash> flash(_spi ?
+				new SPIFlash(reinterpret_cast<FlashInterface *>(_spi), false, _verbose):
+				new SPIFlash(this, false, _verbose));
+		flash->read_id();
+		flash->display_status_reg();
+	} catch (std::exception &e) {
+		printError("Fail");
+		printError(std::string(e.what()));
+		return false;
+	}
+
+	return post_flash_access();
+}
+
+/**
+ * Dump flash contents to file. Works in both SPI and JTAG-SPI-bypass mode.
+ */
+bool CologneChip::dumpFlash(uint32_t base_addr, uint32_t len)
+{
+	/* prepare SPI access */
+	prepare_flash_access();
+
+	printInfo("Read Flash ", false);
+	try {
+		std::unique_ptr<SPIFlash> flash(_spi ?
+				new SPIFlash(reinterpret_cast<FlashInterface *>(_spi), false, _verbose):
+				new SPIFlash(this, false, _verbose));
+		flash->dump(_filename, base_addr, len);
+	} catch (std::exception &e) {
+		printError("Fail");
+		printError(std::string(e.what()));
+		return false;
+	}
+
+	return post_flash_access();
+}
+
+/**
+ * Set QE bit, if available. Works in both SPI and JTAG-SPI-bypass mode.
+ */
+bool CologneChip::set_quad_bit(bool set_quad)
+{
+	if (!FlashInterface::set_quad_bit(set_quad)) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Peform bulk erase. Works in both SPI and JTAG-SPI-bypass mode.
+ */
+bool CologneChip::bulk_erase_flash()
+{
+	if (!FlashInterface::bulk_erase_flash()) {
+		return false;
+	}
 
 	return true;
 }
@@ -171,14 +256,14 @@ void CologneChip::program(unsigned int offset, bool unprotect_flash)
 	if (_mode == Device::NONE_MODE || _mode == Device::READ_MODE)
 		return;
 
-	ConfigBitstreamParser *cfg;
+	std::unique_ptr<ConfigBitstreamParser> cfg;
 	if (_file_extension == "cfg") {
-		cfg = new CologneChipCfgParser(_filename);
+		cfg.reset(new CologneChipCfgParser(_filename));
 	} else if (_file_extension == "bit") {
-		cfg = new RawParser(_filename, false);
+		cfg.reset(new RawParser(_filename, false));
 	} else { /* unknown type: */
 		if (_mode == Device::FLASH_MODE) {
-			cfg = new RawParser(_filename, false);
+			cfg.reset(new RawParser(_filename, false));
 		} else {
 			throw std::runtime_error("incompatible file format");
 		}
@@ -186,23 +271,21 @@ void CologneChip::program(unsigned int offset, bool unprotect_flash)
 
 	cfg->parse();
 
-	uint8_t *data = cfg->getData();
+	const uint8_t *data = cfg->getData();
 	int length = cfg->getLength() / 8;
 
 	switch (_mode) {
 		case Device::FLASH_MODE:
-			if (_jtag != NULL) {
+			if (_jtag != NULL)
 				programJTAG_flash(offset, data, length, unprotect_flash);
-			} else if (_jtag == NULL) {
+			else
 				programSPI_flash(offset, data, length, unprotect_flash);
-			}
 			break;
 		case Device::MEM_MODE:
-			if (_jtag != NULL) {
+			if (_jtag != NULL)
 				programJTAG_sram(data, length);
-			} else if (_jtag == NULL) {
+			else
 				programSPI_sram(data, length);
-			}
 			break;
 		default: /* avoid warning */
 			break;
@@ -211,42 +294,37 @@ void CologneChip::program(unsigned int offset, bool unprotect_flash)
 
 /**
  * Write configuration into FPGA latches via SPI after active reset.
- * CFG_MD[3:0] must be set to 0x40 (SPI passive).
+ * CFG_MD[3:0] must be set to 0x4 (SPI passive).
  */
-void CologneChip::programSPI_sram(uint8_t *data, int length)
+void CologneChip::programSPI_sram(const uint8_t *data, int length)
 {
 	/* hold device in reset for a moment */
 	reset();
 
-	uint8_t *recv = new uint8_t[length];
+	ProgressBar progress("Loading SRAM via SPI", length, 50, _verbose);
 	_spi->gpio_set(_rstn_pin);
-	_spi->spi_put(data, recv, length); // TODO _spi->spi_put(data, null, length) does not work?
+	_spi->spi_put(data, NULL, length);
+	progress.done();
 
 	waitCfgDone();
 
 	_spi->gpio_set(_oen_pin);
-	delete [] recv;
 }
 
 /**
  * Write configuration to flash via SPI while FPGA is in active reset. When
  * done, release reset to start FPGA in active SPI mode (load from flash).
- * CFG_MD[3:0] must be set to 0x00 (SPI active).
+ * CFG_MD[3:0] must be set to 0x0 (SPI active).
  */
-void CologneChip::programSPI_flash(unsigned int offset, uint8_t *data,
+void CologneChip::programSPI_flash(unsigned int offset, const uint8_t *data,
 		int length, bool unprotect_flash)
 {
 	/* hold device in reset during flash write access */
 	_spi->gpio_clear(_rstn_pin | _oen_pin);
 	usleep(SLEEP_US);
 
-	SPIFlash flash(reinterpret_cast<SPIInterface *>(_spi), unprotect_flash,
+	SPIFlash flash(reinterpret_cast<FlashInterface *>(_spi), unprotect_flash,
 			_verbose);
-	flash.reset();
-	flash.power_up();
-
-	printf("%02x\n", flash.read_status_reg());
-	flash.read_id();
 	flash.erase_and_prog(offset, data, length);
 
 	/* verify write if required */
@@ -263,9 +341,9 @@ void CologneChip::programSPI_flash(unsigned int offset, uint8_t *data,
 
 /**
  * Write configuration into FPGA latches via JTAG after active reset.
- * CFG_MD[3:0] must be set to 0xF0 (JTAG).
+ * CFG_MD[3:0] must be set to 0xC (JTAG).
  */
-void CologneChip::programJTAG_sram(uint8_t *data, int length)
+void CologneChip::programJTAG_sram(const uint8_t *data, int length)
 {
 	/* hold device in reset for a moment */
 	reset();
@@ -279,54 +357,62 @@ void CologneChip::programJTAG_sram(uint8_t *data, int length)
 
 	ProgressBar progress("Load SRAM via JTAG", length, 50, _quiet);
 
+	/* the bypass register defaults to '0'.
+	 * in order to generate a proper 'nop' command (0x00, 0xFF), send a
+	 * sequence of zeros instead of ones.
+	 */
+	if (_jtag->get_devices_list().size() > 1) {
+		int bits_before = 8 - (_jtag->get_device_index() % 8);
+		_jtag->set_state(Jtag::SHIFT_DR, 0);
+		_jtag->toggleClk(bits_before, 0);
+	}
+
+	Jtag::tapState_t next_state = Jtag::SHIFT_DR;
 	for (int i = 0; i < length; i += size) {
-		if (length < i + size)
+		if (length < i + size) {
 			size = length-i;
+			next_state = Jtag::RUN_TEST_IDLE;
+		}
 
 		for (int ii = 0; ii < size; ii++)
 			tmp[ii] = data[i+ii];
 
-		_jtag->shiftDR(tmp, NULL, size*8, Jtag::SHIFT_DR);
+		_jtag->shiftDR(tmp, NULL, size*8, next_state);
 		progress.display(i);
 	}
 
 	progress.done();
-	_jtag->set_state(Jtag::RUN_TEST_IDLE);
 
-	waitCfgDone();
-
-	_ftdi_jtag->gpio_set(_oen_pin);
+	if (_ftdi_jtag) {
+		waitCfgDone();
+		_ftdi_jtag->gpio_set(_oen_pin);
+	}
 }
 
 /**
  * Write configuration to flash via JTAG-SPI-bypass. The FPGA will not start
- * as it is in JTAG mode with CFG_MD[3:0] set to 0xF0 (JTAG).
+ * as it is in JTAG mode with CFG_MD[3:0] set to 0xC (JTAG).
  */
-void CologneChip::programJTAG_flash(unsigned int offset, uint8_t *data,
+void CologneChip::programJTAG_flash(unsigned int offset, const uint8_t *data,
 		int length, bool unprotect_flash)
 {
 	/* hold device in reset for a moment */
 	reset();
 
 	SPIFlash flash(this, unprotect_flash, _verbose);
-	flash.reset();
-	flash.power_up();
-
-	printf("%02x\n", flash.read_status_reg());
-	flash.read_id();
 	flash.erase_and_prog(offset, data, length);
 
 	/* verify write if required */
 	if (_verify)
 		flash.verify(offset, data, length);
 
-	_ftdi_jtag->gpio_set(_oen_pin);
+	post_flash_access();
 }
 
 /**
  * Overrides spi_put() to access SPI components via JTAG-SPI-bypass.
  */
-int CologneChip::spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx, uint32_t len)
+int CologneChip::spi_put(uint8_t cmd, const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
 	int xfer_len = len + 1;
 	uint8_t jtx[xfer_len+2];
@@ -339,16 +425,18 @@ int CologneChip::spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx, uint32_t len)
 			jtx[i+1] = ConfigBitstreamParser::reverseByte(tx[i]);
 	}
 
-	_jtag->shiftIR(JTAG_SPI_BYPASS, 6, Jtag::SELECT_DR_SCAN);
+	_jtag->shiftIR(JTAG_SPI_BYPASS, 6, Jtag::SHIFT_DR);
 
-	int test = (rx == NULL) ? 8*xfer_len+1 : 8*xfer_len+2;
-	_jtag->shiftDR(jtx, (rx == NULL)? NULL: jrx, test, Jtag::SELECT_DR_SCAN);
+	int drlen = (rx == NULL) ? 8*xfer_len : 8*xfer_len+1;
+	_jtag->read_write(jtx, (rx == NULL) ? NULL : jrx, drlen, false);
+
+	int shift = _jtag->get_devices_list().size();
 
 	if (rx != NULL) {
 		for (uint32_t i=0; i < len; i++) {
 			uint8_t b0 = ConfigBitstreamParser::reverseByte(jrx[i+1]);
 			uint8_t b1 = ConfigBitstreamParser::reverseByte(jrx[i+2]);
-			rx[i] = (b0 << 1) | ((b1 >> 7) & 0x01);
+			rx[i] = (b0 << shift) | (b1 >> (8-shift));
 		}
 	}
 	return 0;
@@ -357,7 +445,7 @@ int CologneChip::spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx, uint32_t len)
 /**
  * Overrides spi_put() to access SPI components via JTAG-SPI-bypass.
  */
-int CologneChip::spi_put(uint8_t *tx, uint8_t *rx, uint32_t len)
+int CologneChip::spi_put(const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
 	int xfer_len = len;
 	uint8_t jtx[xfer_len+2];
@@ -382,13 +470,13 @@ int CologneChip::spi_put(uint8_t *tx, uint8_t *rx, uint32_t len)
 }
 
 /**
- * Overrides spi_put() to access SPI components via JTAG-SPI-bypass.
+ * Overrides spi_wait() to access SPI components via JTAG-SPI-bypass.
  */
 int CologneChip::spi_wait(uint8_t cmd, uint8_t mask, uint8_t cond,
 						  uint32_t timeout, bool verbose)
 {
 	uint8_t rx[2];
-	uint8_t dummy[2];
+	uint8_t dummy[2] = {0xff};
 	uint8_t tmp;
 	uint8_t tx = ConfigBitstreamParser::reverseByte(cmd);
 	uint32_t count = 0;
@@ -396,16 +484,13 @@ int CologneChip::spi_wait(uint8_t cmd, uint8_t mask, uint8_t cond,
 	_jtag->shiftIR(JTAG_SPI_BYPASS, 6, Jtag::SHIFT_DR);
 	_jtag->read_write(&tx, NULL, 8, 0);
 
+	int shift = _jtag->get_devices_list().size();
+
 	do {
-		if (count == 0) {
-			_jtag->read_write(dummy, rx, 9, 0);
-			uint8_t b0 = ConfigBitstreamParser::reverseByte(rx[0]);
-			uint8_t b1 = ConfigBitstreamParser::reverseByte(rx[1]);
-			tmp = (b0 << 1) | ((b1 >> 7) & 0x01);
-		} else {
-			_jtag->read_write(dummy, rx, 8, 0);
-			tmp = ConfigBitstreamParser::reverseByte(rx[0]);
-		}
+		_jtag->read_write(dummy, rx, 16, 0);
+		uint8_t b0 = ConfigBitstreamParser::reverseByte(rx[0]);
+		uint8_t b1 = ConfigBitstreamParser::reverseByte(rx[1]);
+		tmp = (b0 << shift) | (b1 >> (8-shift));
 
 		count++;
 		if (count == timeout) {

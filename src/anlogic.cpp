@@ -29,7 +29,7 @@ Anlogic::Anlogic(Jtag *jtag, const std::string &filename,
 	const std::string &file_type,
 	Device::prog_type_t prg_type, bool verify, int8_t verbose):
 	Device(jtag, filename, file_type, verify, verbose),
-	SPIInterface(filename, verbose, 0, verify), _svf(_jtag, _verbose)
+	FlashInterface(filename, verbose, 0, verify), _target_freq(0)
 {
 	if (prg_type == Device::RD_FLASH) {
 		_mode = Device::READ_MODE;
@@ -64,11 +64,6 @@ void Anlogic::program(unsigned int offset, bool unprotect_flash)
 	if (_mode == Device::NONE_MODE)
 		return;
 
-	if (_file_extension == "svf") {
-		_svf.parse(_filename);
-		return;
-	}
-
 	AnlogicBitParser bit(_filename, (_mode == Device::MEM_MODE), _verbose);
 
 	printInfo("Parse file ", false);
@@ -82,11 +77,11 @@ void Anlogic::program(unsigned int offset, bool unprotect_flash)
 	if (_verbose)
 		bit.displayHeader();
 
-	uint8_t *data = bit.getData();
+	const uint8_t *data = bit.getData();
 	int len = bit.getLength() / 8;
 
 	if (_mode == Device::SPI_MODE) {
-		SPIInterface::write(offset, data, len, unprotect_flash);
+		FlashInterface::write(offset, data, len, unprotect_flash);
 		return;
 	}
 
@@ -115,14 +110,10 @@ void Anlogic::program(unsigned int offset, bool unprotect_flash)
 
 		ProgressBar progress("Loading", len, 50, _quiet);
 		int pos = 0;
-		uint8_t *ptr = data;
+		const uint8_t *ptr = data;
 		while (len > 0) {
 			int xfer_len = (len > 512)?512:len;
-			int tx_end;
-			if (len - xfer_len == 0)
-				tx_end = Jtag::RUN_TEST_IDLE;
-			else
-				tx_end = Jtag::SHIFT_DR;
+			Jtag::tapState_t tx_end = (len - xfer_len) ? Jtag::SHIFT_DR : Jtag::RUN_TEST_IDLE;
 			_jtag->shiftDR(ptr, NULL, xfer_len * 8, tx_end);
 			len -= xfer_len;
 			progress.display(pos);
@@ -148,7 +139,7 @@ void Anlogic::program(unsigned int offset, bool unprotect_flash)
 	}
 }
 
-int Anlogic::idCode()
+uint32_t Anlogic::idCode()
 {
 	unsigned char tx_data[4];
 	unsigned char rx_data[4];
@@ -166,6 +157,11 @@ int Anlogic::idCode()
 
 bool Anlogic::prepare_flash_access()
 {
+	_target_freq = _jtag->getClkFreq();
+	if (_target_freq > 6000000) {
+		_jtag->setClkFreq(6000000);
+	}
+
 	for (int i = 0; i < 5; i++)
 		_jtag->shiftIR(BYPASS, IRLENGTH);
 	//Verify Device id.
@@ -183,13 +179,20 @@ bool Anlogic::prepare_flash_access()
 	return true;
 }
 
+void Anlogic::restore_flash_access_frequency()
+{
+	if (_target_freq > 6000000) {
+		_jtag->setClkFreq(_target_freq);
+	}
+}
+
 /* SPI wrapper
  * For read operation a delay of one bit is added
  * So add one bit more and move everything by one
  * In write only operations to care about this delay
  */
 
-int Anlogic::spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx, uint32_t len)
+int Anlogic::spi_put(uint8_t cmd, const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
 	int xfer_len = len + 1;
 	if (rx)
@@ -215,7 +218,7 @@ int Anlogic::spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx, uint32_t len)
 	}
 	return 0;
 }
-int Anlogic::spi_put(uint8_t *tx, uint8_t *rx, uint32_t len)
+int Anlogic::spi_put(const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
 	int xfer_len = len;
 	if (rx)

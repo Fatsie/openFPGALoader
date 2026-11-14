@@ -14,9 +14,8 @@
 #include "jedParser.hpp"
 #include "xilinxMapParser.hpp"
 
-using namespace std;
 
-XilinxMapParser::XilinxMapParser(const string &filename,
+XilinxMapParser::XilinxMapParser(const std::string &filename,
 		uint16_t num_row, uint16_t num_col,
 		JedParser *jed, const uint32_t usercode,
 		bool verbose): ConfigBitstreamParser(filename,
@@ -42,7 +41,7 @@ int XilinxMapParser::parse()
 
 	while(std::getline(ss, line, '\n')) {
 		bool empty = true;  // to said if line contains only '\t' (empty)
-		                    // or one or more blank in a non empty line
+							// or one or more blank in a non empty line
 		size_t prev_pos = 0, next_pos;
 		int row = 0;
 		/* suppress potential '\r' (thanks windows) */
@@ -61,7 +60,7 @@ int XilinxMapParser::parse()
 			} else {
 				empty = false;  // current line is not fully empty
 				int len = end_pos - prev_pos;  // section len
-				string cnt = line.substr(prev_pos, len);  // line substring
+				std::string cnt = line.substr(prev_pos, len);  // line substring
 				if (cnt[0] <= '9' && cnt[0] >= '0') {  // numeric value (index)
 					map_val = std::stoi(cnt, nullptr, 10);
 				} else {  // information (done, spare, user, ...)
@@ -74,8 +73,15 @@ int XilinxMapParser::parse()
 						map_val = (cnt[5] == '0') ? BIT_ONE: BIT_ZERO;
 					/* fill usercode now instead of waiting for fuse placement */
 					} else if (!strncmp(cnt.c_str(), "user", 4)) {
-						int idx = stoi(cnt.substr(5));
-						map_val = ((_usercode >> idx) & 0x01) ? BIT_ONE : BIT_ZERO;
+						/* some maps (xc2c128/256/384/512) contain a bare
+						 * "user" without index: handle it like spare
+						 */
+						if (cnt.size() <= 5) {
+							map_val = BIT_ONE;
+						} else {
+							int idx = stoi(cnt.substr(5));
+							map_val = ((_usercode >> idx) & 0x01) ? BIT_ONE : BIT_ZERO;
+						}
 					} else {
 						printf("unknown %s %s\n", cnt.c_str(), line.c_str());
 						return false;

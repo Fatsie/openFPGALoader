@@ -11,10 +11,10 @@
 #include "bitparser.hpp"
 #include "device.hpp"
 #include "jtag.hpp"
-#include "spiInterface.hpp"
+#include "flashInterface.hpp"
 #include "svf_jtag.hpp"
 
-class Anlogic: public Device, SPIInterface {
+class Anlogic: public Device, FlashInterface {
 	public:
 		Anlogic(Jtag *jtag, const std::string &filename,
 			const std::string &file_type,
@@ -22,7 +22,7 @@ class Anlogic: public Device, SPIInterface {
 		~Anlogic();
 
 		void program(unsigned int offset, bool unprotect_flash) override;
-		int idCode() override;
+		uint32_t idCode() override;
 		void reset() override;
 
 		/* spi interface */
@@ -30,14 +30,21 @@ class Anlogic: public Device, SPIInterface {
 		 * \brief protect SPI flash blocks
 		 */
 		bool protect_flash(uint32_t len) override {
-			return SPIInterface::protect_flash(len);
+			return FlashInterface::protect_flash(len);
 		}
 
 		/*!
 		 * \brief protect SPI flash blocks
 		 */
 		bool unprotect_flash() override {
-			return SPIInterface::unprotect_flash();
+			return FlashInterface::unprotect_flash();
+		}
+
+		/*!
+		 * \brief bulk erase SPI flash
+		 */
+		bool bulk_erase_flash() override {
+			return FlashInterface::bulk_erase_flash();
 		}
 
 		/*!
@@ -47,12 +54,12 @@ class Anlogic: public Device, SPIInterface {
 		 * \return false if something wrong
 		 */
 		virtual bool dumpFlash(uint32_t base_addr, uint32_t len) override {
-			return SPIInterface::dump(base_addr, len);
+			return FlashInterface::dump(base_addr, len);
 		}
 
-		int spi_put(uint8_t cmd, uint8_t *tx, uint8_t *rx,
+		int spi_put(uint8_t cmd, const uint8_t *tx, uint8_t *rx,
 			uint32_t len) override;
-		int spi_put(uint8_t *tx, uint8_t *rx, uint32_t len) override;
+		int spi_put(const uint8_t *tx, uint8_t *rx, uint32_t len) override;
 		int spi_wait(uint8_t cmd, uint8_t mask, uint8_t cond,
 			uint32_t timeout, bool verbose=false) override;
 
@@ -62,12 +69,17 @@ class Anlogic: public Device, SPIInterface {
 		 */
 		virtual bool prepare_flash_access() override;
 		/*!
+		 * \brief restore frequency after flash ID read
+		 */
+		virtual void restore_flash_access_frequency() override;
+		/*!
 		 * \brief end of device to SPI access
 		 */
 		virtual bool post_flash_access() override {reset(); return true;}
 
-	private:
-		SVF_jtag _svf;
+private:
+		uint32_t _target_freq; /*< target JTAG frequency */
+
 };
 
 #endif  // SRC_ANLOGIC_HPP_

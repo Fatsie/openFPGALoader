@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "cable.hpp"
 #include "jtagInterface.hpp"
 #include "ftdipp_mpsse.hpp"
 
@@ -22,8 +23,8 @@
 
 class CH552_jtag : public JtagInterface, private FTDIpp_MPSSE {
  public:
-	CH552_jtag(const FTDIpp_MPSSE::mpsse_bit_config &cable, std::string dev,
-		const std::string &serial, uint32_t clkHZ, uint8_t verbose = false);
+	CH552_jtag(const cable_t &cable, const std::string &dev,
+		const std::string &serial, uint32_t clkHZ, int8_t verbose = false);
 	virtual ~CH552_jtag();
 
 	int setClkFreq(uint32_t clkHZ) override;
@@ -31,11 +32,11 @@ class CH552_jtag : public JtagInterface, private FTDIpp_MPSSE {
 	uint32_t getClkFreq() override {return FTDIpp_MPSSE::getClkFreq();}
 
 	/* TMS */
-	int writeTMS(uint8_t *tms, uint32_t len, bool flush_buffer) override;
+	int writeTMS(const uint8_t *tms, uint32_t len, bool flush_buffer, const uint8_t tdi = 1) override;
 	/* clock */
 	int toggleClk(uint8_t tms, uint8_t tdi, uint32_t clk_len) override;
 	/* TDI */
-	int writeTDI(uint8_t *tx, uint8_t *rx, uint32_t len, bool end) override;
+	int writeTDI(const uint8_t *tx, uint8_t *rx, uint32_t len, bool end) override;
 
 	/*!
 	 * \brief return internal buffer size (in byte).
@@ -48,7 +49,7 @@ class CH552_jtag : public JtagInterface, private FTDIpp_MPSSE {
 	int flush() override;
 
  private:
-	void init_internal(const FTDIpp_MPSSE::mpsse_bit_config &cable);
+	void init_internal(const mpsse_bit_config &cable);
 	uint32_t _to_read; /*!< amount of byte to read */
 };
 #endif  // SRC_CH552_JTAG_HPP_

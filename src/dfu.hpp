@@ -24,7 +24,8 @@ class DFU {
 		 * \param[in] altsetting: device altsetting to use
 		 * \param[in] verbose_lvl: verbose level 0 normal, -1 quiet, 1 verbose
 		 */
-		DFU(const std::string &filename, uint16_t vid, uint16_t pid,
+		DFU(const std::string &filename, bool bypass_bitstream,
+				uint16_t vid, uint16_t pid,
 				int16_t altsetting, int verbose_lvl);
 
 		~DFU();
@@ -51,12 +52,12 @@ class DFU {
 		 * \brief dfu descriptor structure (not provided by libusb
 		 */
 		struct dfu_desc {
-		    uint8_t  bLength;
-		    uint8_t  bDescriptorType;
-		    uint8_t  bmAttributes;
-		    uint16_t wDetachTimeOut;
-		    uint16_t wTransferSize;
-		    uint16_t bcdDFUVersion;
+			uint8_t  bLength;
+			uint8_t  bDescriptorType;
+			uint8_t  bmAttributes;
+			uint16_t wDetachTimeOut;
+			uint16_t wTransferSize;
+			uint16_t bcdDFUVersion;
 		} __attribute__((__packed__));
 
 		struct dfu_dev {
@@ -199,15 +200,15 @@ class DFU {
 		 * \brief send an IN/OUT request
 		 */
 		int send(bool out, uint8_t brequest, uint16_t wvalue,
-				unsigned char *data, uint16_t length);
+				const uint8_t *data, uint16_t length);
 		/*!
 		 * \brief fill specific DFU structure with extra descriptor
 		 * \param[in] intf: interface descriptor with extra area
 		 * \param[out] dfu_desc: DFU descriptor
 		 * \param[in] dfu_desc_size: DFU descriptor structure size
-		 * \return -1 if extra len is too small, 0 otherwise
+		 * \return false if extra len is too small, true otherwise
 		 * */
-		int parseDFUDescriptor(const struct libusb_interface_descriptor *intf,
+		bool parseDFUDescriptor(const struct libusb_interface_descriptor *intf,
 				uint8_t *dfu_desc, int dfu_desc_size);
 		/*!
 		 * \brief try to open device specified by vid and pid. If found
@@ -234,7 +235,7 @@ class DFU {
 		int dev_idx;                         /**< device index in dfu_dev */
 		uint16_t _vid;                       /**< device Vendor ID */
 		uint16_t _pid;                       /**< device Product ID */
-		int16_t _altsetting;                 /**< device altesetting */
+		int16_t _altsetting;                 /**< device altsetting */
 		struct libusb_context *usb_ctx;      /**< usb context */
 		libusb_device_handle * dev_handle;   /**< current device handle */
 		int curr_intf;                       /**< device interface to use */
